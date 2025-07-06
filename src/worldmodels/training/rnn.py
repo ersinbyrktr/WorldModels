@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader
+
+from src.worldmodels.models.rnn import MDN_LSTM
 
 
 @dataclass
@@ -17,12 +18,12 @@ class TrainCfg:
     batch_size: int = 32
 
 
-def init_hidden(model: nn.Module, batch: int):
+def init_hidden(model: MDN_LSTM, batch: int):
     h = torch.zeros(model.cfg.num_layers, batch, model.hidden_size, device=next(model.parameters()).device)
     return (h, h.clone())  # (hidden, cell)
 
 
-def train(model: nn.Module, loader: DataLoader, cfg: TrainCfg):
+def train(model: MDN_LSTM, loader: DataLoader, cfg: TrainCfg):
     device = next(model.parameters()).device
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     sched = StepLR(opt, step_size=cfg.step_size, gamma=cfg.gamma)
