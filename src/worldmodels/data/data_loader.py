@@ -18,16 +18,6 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import transforms
 
 
-# ----------------------------------------------------------
-# tiny helpers
-# ----------------------------------------------------------
-def _seed_everything(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
 def _default_transform(sz: Tuple[int, int] = (64, 64)) -> Callable[[Image.Image], torch.Tensor]:
     """Resize and convert PIL image to  [0,1]  float32 tensor."""
     return transforms.Compose([
@@ -130,14 +120,12 @@ def make_dataloaders(
         *,
         batch_size: int = 64,
         num_workers: int = 4,
-        seed: int = 42,
         train_split: float = 0.9,
         shuffle_train: bool = True,
 ) -> tuple[DataLoader, DataLoader]:
     """
     Returns (train_loader, val_loader)
     """
-    _seed_everything(seed)
     full_ds = WorldModelsFrames(root)
     N = len(full_ds)
     idxs = list(range(N))

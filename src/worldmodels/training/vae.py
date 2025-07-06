@@ -8,10 +8,16 @@ from src.worldmodels.utils import save_grid
 
 
 def train(model, train_loader, test_loader, *, epochs: int, lr: float,
-          beta: float, kl_on: bool, warm: int, outdir: str):
+          beta: float, kl_on: bool, warm: int, outdir: str, model_path: str = None,
+          save_freq: int = 10):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(dev)
     os.makedirs(outdir, exist_ok=True)
+
+    # Set default model path if not provided
+    if model_path is None:
+        model_path = os.path.join(outdir, "model_checkpoints")
+    os.makedirs(model_path, exist_ok=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, fused=(dev.type == "cuda"))
     scaler = torch.amp.GradScaler(enabled=dev.type == "cuda")
@@ -69,3 +75,13 @@ def train(model, train_loader, test_loader, *, epochs: int, lr: float,
             recon_grid = torch.cat([real_row, recon_row], dim=0)  # [16, 3, 64, 64]
 
         save_grid(recon_grid, f"{outdir}/recon_ep{ep}.png", nrow=8)
+
+        # Save model checkpoint
+        if (ep % save_freq == 0 or ep == epochs):
+            checkpoint_path = os.path.join(model_path, f"vae_checkpoint_ep{ep}.pt")
+            model.save_model(checkpoint_path)
+            print(f"Model saved to {checkpoint_path}")
+
+            # Save latest model for easy loading
+            latest_path = os.path.join(model_path, "vae_latest.pt")
+            model.save_model(latest_path)

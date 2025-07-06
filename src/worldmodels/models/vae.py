@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,10 +12,8 @@ import torch.nn.functional as F
 from src.worldmodels.data.data_loader import make_dataloaders
 from src.worldmodels.evaluation.vae import evaluate
 from src.worldmodels.training.vae import train
-from src.worldmodels.utils import set_seed
 
 
-# ———————————————————— model ————————————————————
 class VAE(nn.Module):
     def __init__(self, *, latent: int = 20, recon_loss: str = "BCE"):
         super().__init__()
@@ -117,6 +116,49 @@ class VAE(nn.Module):
         kl = 0.5 * (mu.pow(2) + logvar.exp() - 1. - logvar).sum(dim=1)  # [N]
         return rc, kl
 
+    def save_model(self, path):
+        """
+        Save model state to disk
+
+        Parameters
+        ----------
+        path : str
+            Path where the model will be saved
+        """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({
+            'model_state_dict': self.state_dict(),
+            'latent': self.latent,
+            'recon_loss': self.recon_loss
+        }, path)
+
+    @classmethod
+    def load_model(cls, path, device=None):
+
+        """
+        Load a saved model from disk
+
+        Parameters
+        ----------
+        path : str
+            Path to the saved model
+        device : torch.device, optional
+            Device to load the model to
+
+        Returns
+        -------
+        model : VAE
+            Loaded model
+        """
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        checkpoint = torch.load(path, map_location=device)
+        model = cls(latent=checkpoint['latent'], recon_loss=checkpoint['recon_loss'])
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.to(device)
+        return model
+
 
 # ———————————————————— CLI ————————————————————
 
@@ -129,21 +171,39 @@ def main():
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--loss", choices=["L2", "BCE"], default="L2")
     ap.add_argument("--latent", type=int, default=32)
-    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--warm", type=int, default=1)
     ap.add_argument("--outdir", type=str, default="world_models_elbo_outputs")
+    ap.add_argument("--model-path", type=str, default="../../../trained_model",
+                    help="Path to save/load model checkpoints")
+    ap.add_argument("--save-freq", type=int, default=100, help="Save model every N epochs")
+    ap.add_argument("--load-model", type=str, default="../../../trained_model/vae_checkpoint_ep1.pt",
+                    help="Path to load a pretrained model")
     args = ap.parse_args()
-    set_seed(args.seed)
+    torch.backends.cudnn.benchmark = True
     train_loader, test_loader = make_dataloaders(
         "../../../data/carracing",
         batch_size=args.batch,
-        num_workers=min(16, os.cpu_count()),
-        seed=args.seed,
+        num_workers=min(16, os.cpu_count())
     )
-    model = VAE(latent=args.latent, recon_loss=args.loss)
+
+    # Load model if specified, otherwise create a new one
+    if args.load_model:
+        print(f"Loading model from {args.load_model}")
+        model = VAE.load_model(args.load_model)
+        print(f"Model loaded with latent dim={model.latent}, recon_loss={model.recon_loss}")
+    else:
+        model = VAE(latent=args.latent, recon_loss=args.loss)
+
     print(f"Initial val {evaluate(model, test_loader, args.beta):.4f}")
-    train(model, train_loader, test_loader, epochs=args.epochs, lr=args.lr, beta=args.beta, kl_on=not args.no_kl,
-          warm=args.warm, outdir=args.outdir)
+    train(model, train_loader, test_loader,
+          epochs=args.epochs,
+          lr=args.lr,
+          beta=args.beta,
+          kl_on=not args.no_kl,
+          warm=args.warm,
+          outdir=args.outdir,
+          model_path=args.model_path,
+          save_freq=args.save_freq)
 
 
 if __name__ == "__main__":
