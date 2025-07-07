@@ -1,4 +1,4 @@
-# rnn.py (evaluation)
+# evaluation/rnn.py
 # ----------------------------------------------------------
 # Evaluation utilities for the MDN-RNN model
 # ----------------------------------------------------------
@@ -80,13 +80,9 @@ def visualize_latent_predictions(model: MDN_LSTM, latent_sequence: torch.Tensor,
         torch.zeros(model.cfg.num_layers, 1, model.hidden_size, device=device),
         torch.zeros(model.cfg.num_layers, 1, model.hidden_size, device=device)
     )
-
-    for start in range(T):
-        # Fresh hidden state for each window
-        h = tuple(x.clone() for x in h0)
-
-        # One-step forecast
-        wl, mu, ls, _ = model(latent_sequence[start:start + 1], h)
+    h = tuple(x.clone() for x in h0)
+    for t in range(T):
+        wl, mu, ls, h = model(latent_sequence[t:t + 1], h)
         y_hat = model.predict(wl, mu, ls, deterministic=True)  # (1, latent_dim)
         preds.append(y_hat.squeeze(0).cpu())
 

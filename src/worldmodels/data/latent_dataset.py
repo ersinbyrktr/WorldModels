@@ -4,17 +4,14 @@
 # ----------------------------------------------------------
 from __future__ import annotations
 
-import os
-from pathlib import Path
-from typing import Optional, Tuple
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from src.worldmodels.data.data_loader import make_dataloaders
+from src.worldmodels.data.latent_dataset_episode import EpisodicLatentDataset
 from src.worldmodels.models.vae import VAE
+from src.worldmodels.utils.collate import pad_collate
 
 
 class LatentSequenceDataset(Dataset):
@@ -83,87 +80,35 @@ def encode_image_sequences_to_latents(vae_model: VAE, image_dataloader: DataLoad
     return np.concatenate(all_latents, axis=0)
 
 
-def create_latent_dataloaders(
-        vae_model: VAE,
-        data_root: str | Path,
-        *,
-        batch_size: int = 32,
-        num_workers: int = 4,
-        train_val_split: float = 0.9,
-        cached_latents_path: Optional[str] = None,
-        device: Optional[torch.device] = None
-) -> Tuple[DataLoader, DataLoader]:
-    """
-    Create train and validation dataloaders with latent sequences encoded by the VAE.
+def create_rnn_latent_dataloaders(vae,
+                                  data_root,
+                                  *,
+                                  batch_size=32,
+                                  train_split=0.9,
+                                  num_workers=4,
+                                  device=None):
+    # ---- produce *list of arrays*, one per episode -----------------------
+    from .latent_utils import encode_episodes_to_latents  # or your own helper
+    episode_latents = encode_episodes_to_latents(vae,
+                                                 data_root,
+                                                 device=device)
 
-    Args:
-        vae_model: Trained VAE model
-        data_root: Path to image data directory
-        batch_size: Batch size for the dataloader
-        num_workers: Number of workers for the dataloader
-        train_val_split: Split ratio between train and validation sets
-        cached_latents_path: Optional path to save/load cached latent vectors
-        device: Device to use for encoding (defaults to CUDA if available)
+    split = int(len(episode_latents) * train_split)
+    train_ds = EpisodicLatentDataset(episode_latents[:split])
+    val_ds = EpisodicLatentDataset(episode_latents[split:])
 
-    Returns:
-        Tuple[DataLoader, DataLoader]: Train and validation dataloaders
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_dl = DataLoader(train_ds,
+                          batch_size=batch_size,
+                          shuffle=True,
+                          num_workers=num_workers,
+                          pin_memory=True,
+                          collate_fn=pad_collate)
 
-    # Check if we can load cached latents
-    if cached_latents_path and os.path.exists(cached_latents_path):
-        print(f"Loading cached latent vectors from {cached_latents_path}")
-        latent_vectors = np.load(cached_latents_path)
-    else:
-        # Load image data with sequential ordering (no shuffle)
-        print(f"Loading image data from {data_root}")
-        image_loader, _ = make_dataloaders(
-            data_root,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            shuffle_train=False  # Important: keep temporal order for sequences
-        )
+    val_dl = DataLoader(val_ds,
+                        batch_size=batch_size,
+                        shuffle=False,
+                        num_workers=num_workers,
+                        pin_memory=True,
+                        collate_fn=pad_collate)
 
-        # Encode images to latent space
-        print("Encoding images to latent space...")
-        latent_vectors = encode_image_sequences_to_latents(vae_model, image_loader, device)
-
-        # Save latents if path provided
-        if cached_latents_path:
-            os.makedirs(os.path.dirname(cached_latents_path), exist_ok=True)
-            print(f"Saving latent vectors to {cached_latents_path}")
-            np.save(cached_latents_path, latent_vectors)
-
-    # Split into train and validation sets
-    n_samples = len(latent_vectors)
-    split_idx = int(n_samples * train_val_split)
-
-    train_latents = latent_vectors[:split_idx]
-    val_latents = latent_vectors[split_idx:]
-
-    # Create datasets
-    train_dataset = LatentSequenceDatasetV2(train_latents)
-    val_dataset = LatentSequenceDatasetV2(val_latents)
-
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-
-    print(f"Created train dataloader with {len(train_dataset):,} sequences")
-    print(f"Created val dataloader with {len(val_dataset):,} sequences")
-
-    return train_loader, val_loader
+    return train_dl, val_dl

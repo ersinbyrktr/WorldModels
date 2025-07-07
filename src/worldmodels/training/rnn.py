@@ -1,11 +1,14 @@
+# training/rnn.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.optim.lr_scheduler import StepLR
-from torch.utils.data import DataLoader
+
+from src.worldmodels.evaluation.batch_eval import evaluate
 
 
 @dataclass
@@ -22,44 +25,56 @@ def init_hidden(model: nn.Module, batch: int):
     return (h, h.clone())  # (hidden, cell)
 
 
-def train(model: nn.Module, loader: DataLoader, cfg: TrainCfg):
-    device = next(model.parameters()).device
+def train(model, loader, cfg):
+    dev = next(model.parameters()).device
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     sched = StepLR(opt, step_size=cfg.step_size, gamma=cfg.gamma)
-    model.train()
 
     for epoch in range(cfg.epochs):
+        model.train()
         tot, seen = 0.0, 0
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            B, T, C = xb.shape
-            print("shapes:", xb.shape, yb.shape)
-            h = init_hidden(model, B)
 
-            # burn‑in (⚠ detach after loop)
-            h = tuple(i.detach() for i in h)
+        for xb, yb, lens in loader:  # xb : (B,Tmax,C)
+            xb, yb, lens = xb.to(dev), yb.to(dev), lens.to(dev)
+            B, Tmax, C = xb.shape
 
-            out = {k: [] for k in ("wl", "mu", "ls")}
-            for t in range(T):
-                wl, mu, ls, h = model(xb[:, t], h)
-                out["wl"].append(wl)
-                out["mu"].append(mu)
-                out["ls"].append(ls)
+            # sort lengths ↓ for pack; restore order later if you want
+            lens, sort_idx = lens.sort(descending=True)
+            xb, yb = xb[sort_idx], yb[sort_idx]
 
-            out = {
-                "weight_logits": torch.stack(out["wl"], 1).reshape(B * T, -1),
-                "means": torch.stack(out["mu"], 1).reshape(B * T, model.cfg.num_gaussians, C),
-                "log_stds": torch.stack(out["ls"], 1).reshape(B * T, model.cfg.num_gaussians, C),
+            h0 = (
+                torch.zeros(model.cfg.num_layers, B, model.hidden_size, device=dev),
+                torch.zeros(model.cfg.num_layers, B, model.hidden_size, device=dev)
+            )
+
+            packed_in = pack_padded_sequence(xb, lens.cpu(), batch_first=True)
+            packed_out, _ = model.lstm(packed_in, h0)  # (∑lens, H)
+            out, _ = pad_packed_sequence(packed_out, batch_first=True)  # (B,Tmax,H)
+
+            wl, mu, ls = model.mdn(out.reshape(-1, model.hidden_size))
+            wl = wl.reshape(B, Tmax, -1)
+            mu = mu.reshape(B, Tmax, model.cfg.num_gaussians, C)
+            ls = ls.reshape_as(mu)
+
+            # ---------- mask away the padding -----------------------------
+            mask = (torch.arange(Tmax, device=dev)[None, :] < lens[:, None])  # (B,T)
+            mask_f = mask.reshape(-1)  # (B*T)
+
+            target = yb.reshape(-1, C)[mask_f]
+            out_kw = {
+                "weight_logits": wl.reshape(-1, model.cfg.num_gaussians)[mask_f],
+                "means": mu.reshape(-1, model.cfg.num_gaussians, C)[mask_f],
+                "log_stds": ls.reshape(-1, model.cfg.num_gaussians, C)[mask_f],
             }
-            target = yb.reshape(B * T, C)
-            loss = model.loss(target, **out)
+            loss = model.loss(target, **out_kw)
 
+            # --------------------------------------------------------------
             opt.zero_grad()
             loss.backward()
             opt.step()
+
             tot += loss.item() * B
             seen += B
+
         sched.step()
-        print(
-            f"Epoch {epoch + 1}/{cfg.epochs} | LR {sched.get_last_lr()[0]:.1e} | loss {tot / seen:.4f}"
-        )
+        print(f"Epoch {epoch + 1}/{cfg.epochs} | loss {tot / seen:.4f}")

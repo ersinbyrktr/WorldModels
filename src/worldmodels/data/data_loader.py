@@ -115,7 +115,7 @@ class WorldModelsFrames(Dataset):
 # ----------------------------------------------------------
 # Convenience factory
 # ----------------------------------------------------------
-def make_dataloaders(
+def make_vae_dataloaders(
         root: str | Path,
         *,
         batch_size: int = 64,

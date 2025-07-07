@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.worldmodels.data.data_loader import make_dataloaders
+from src.worldmodels.data.data_loader import make_vae_dataloaders
 from src.worldmodels.evaluation.vae import evaluate
 from src.worldmodels.training.vae import train
 
@@ -180,7 +180,7 @@ def main():
                     help="Path to load a pretrained model")
     args = ap.parse_args()
     torch.backends.cudnn.benchmark = True
-    train_loader, test_loader = make_dataloaders(
+    train_loader, test_loader = make_vae_dataloaders(
         "../../../data/carracing",
         batch_size=args.batch,
         num_workers=min(16, os.cpu_count())
