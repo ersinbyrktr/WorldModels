@@ -34,7 +34,6 @@ def sliding_window_predict_and_plot(
         model: MDN_LSTM,
         series: np.ndarray | torch.Tensor,
         *,
-        t_warm_up: int | None = None,
         deterministic: bool = True,
         title: str = "MDN‑LSTM fit",
         ax: plt.Axes | None = None,
@@ -44,7 +43,6 @@ def sliding_window_predict_and_plot(
     then a side‑by‑side plot of ground truth vs. forecasts.
     """
     model.eval()
-    t_warm_up = t_warm_up or model.t_warm_up
     dev = next(model.parameters()).device
 
     # ensure (T, C) float32 on device
@@ -57,28 +55,24 @@ def sliding_window_predict_and_plot(
     h0 = (torch.zeros(model.cfg.num_layers, 1, model.hidden_size, device=dev),
           torch.zeros(model.cfg.num_layers, 1, model.hidden_size, device=dev))
 
-    for start in range(T - t_warm_up):
+    for start in range(T):
         # fresh hidden each window
         h = tuple(x.clone() for x in h0)
 
-        # 1) warm‑up
-        for t in range(t_warm_up):
-            _, _, _, h = model(series[start + t:start + t + 1], h)
-
         # 2) one‑step forecast
-        wl, mu, ls, _ = model(series[start + t_warm_up:start + t_warm_up + 1], h)
+        wl, mu, ls, _ = model(series[start:start + 1], h)
         y_hat = model.predict(wl, mu, ls, deterministic=deterministic)  # (1,C)
         preds.append(y_hat.squeeze(0).cpu())
 
-    preds = torch.stack(preds)  # (T‑warm_up, C)
+    preds = torch.stack(preds)  # (T, C)
 
     # ────── plotting ───────────────────────────────────────────────────────
     if ax is None:
         _, ax = plt.subplots(figsize=(10, 4))
     t = np.arange(T)
     ax.plot(t, _np(series)[:, 0], label="ground truth", lw=1.2)
-    ax.plot(t[t_warm_up:], _np(preds)[:, 0], label="prediction", lw=1.2)
-    ax.set_xlabel("time step");
+    ax.plot(t, _np(preds)[:, 0], label="prediction", lw=1.2)
+    ax.set_xlabel("time step")
     ax.set_ylabel("xₜ")
     ax.set_title(f"{title} ({'det' if deterministic else 'sampled'})")
     ax.legend()
@@ -86,7 +80,7 @@ def sliding_window_predict_and_plot(
     plt.tight_layout();
     plt.show()
 
-    return preds  # (T‑t_warm_up, C)
+    return preds  # (T, C)
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -95,12 +89,11 @@ def sliding_window_predict_and_plot(
 
 @dataclass
 class ModelCfg:
-    input_size: int = 1
-    output_size: int = 1
+    input_size: int = 32  # Default to VAE latent dimension
+    output_size: int = 32  # Default to VAE latent dimension
     hidden_size: int = 768  # 512 + 256
     num_layers: int = 1  # LSTM only
-    num_gaussians: int = 4
-    t_warm_up: int = 50
+    num_gaussians: int = 5  # World Models uses 5 mixtures
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -221,14 +214,23 @@ def mdn_loss(
         means: torch.Tensor,
         log_stds: torch.Tensor,
 ):
-    """Negative log‑likelihood for a diagonal Gaussian mixture."""
-    target = target.unsqueeze(1)  # (B → B,1)
+    """Negative log‑likelihood for a diagonal Gaussian mixture.
+
+    Args:
+        target: Shape (B, D) where D is latent dimension
+        weight_logits: Shape (B, K) where K is number of mixtures
+        means: Shape (B, K, D)
+        log_stds: Shape (B, K, D)
+    """
+    target = target.unsqueeze(1)  # (B, D) → (B, 1, D)
     inv_var = torch.exp(-2 * log_stds)
+    # Calculate log probability for each dimension and sum across dimensions
     log_prob = (
             -0.5 * (target - means).pow(2) * inv_var - log_stds - 0.5 * math.log(2 * math.pi)
-    ).sum(dim=-1)
-    log_mix = F.log_softmax(weight_logits, dim=1)
-    return -torch.logsumexp(log_prob + log_mix, dim=-1).mean()
+    ).sum(dim=-1)  # Sum across dimensions, result: (B, K)
+    log_mix = F.log_softmax(weight_logits, dim=1)  # (B, K)
+    # Log-sum-exp trick for numerical stability
+    return -torch.logsumexp(log_prob + log_mix, dim=-1).mean()  # Mean over batch
 
 
 def mdn_predict(
@@ -273,7 +275,6 @@ class MDN_LSTM(nn.Module):
     def __init__(self, cfg: ModelCfg):
         super().__init__()
         self.cfg = cfg
-        self.t_warm_up = cfg.t_warm_up
         self.lstm = nn.LSTM(
             cfg.input_size, cfg.hidden_size, num_layers=cfg.num_layers, batch_first=True
         )
@@ -291,54 +292,147 @@ class MDN_LSTM(nn.Module):
     loss = staticmethod(mdn_loss)
     predict = staticmethod(mdn_predict)
 
+    def save_model(self, path):
+        """Save model state to disk"""
+        import os
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({
+            'model_state_dict': self.state_dict(),
+            'model_config': self.cfg
+        }, path)
+
+    @classmethod
+    def load_model(cls, path, device=None):
+        """Load a saved model from disk"""
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        checkpoint = torch.load(path, map_location=device)
+        model = cls(checkpoint['model_config'])
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.to(device)
+        return model
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 #  Entry‑point (CLI or import)
 # ────────────────────────────────────────────────────────────────────────────────
 
 def main(args: Optional[Sequence[str]] = None):
-    p = argparse.ArgumentParser(description="Train MDN‑RNN/LSTM on toy data")
+    p = argparse.ArgumentParser(description="Train MDN‑RNN/LSTM on VAE latent space")
     # basic hyper‑params
-    p.add_argument("--hidden", type=int, default=768)
+    p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--layers", type=int, default=1)
-    p.add_argument("--warm", type=int, default=50)
-    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--bs", type=int, default=32)
     p.add_argument("--seed", type=int, default=0)
+    # VAE integration params
+    p.add_argument("--vae-path", type=str, default="../../../trained_model/vae_latest.pt",
+                   help="Path to trained VAE model")
+    p.add_argument("--data-path", type=str, default="../../../data/carracing",
+                   help="Path to image data directory")
+    p.add_argument("--sequence-length", type=int, default=100,
+                   help="Length of sequences for RNN training")
+    p.add_argument("--latent-cache", type=str, default=None,
+                   help="Optional path to cache/load encoded latent vectors")
+    p.add_argument("--demo-mode", action="store_true", default=False,
+                   help="Run with toy data instead of VAE latents (for testing)")
+    p.add_argument("--model-save-path", type=str, default="../../../trained_models/rnn_model.pt",
+                   help="Path to save the trained model")
+
     cfg_ns = p.parse_args(args)
 
     torch.manual_seed(cfg_ns.seed)
     np.random.seed(cfg_ns.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model_cfg = ModelCfg(
-        hidden_size=cfg_ns.hidden,
-        num_layers=cfg_ns.layers,
-        t_warm_up=cfg_ns.warm_up if hasattr(cfg_ns, "warm_up") else cfg_ns.warm,
-    )
-    train_cfg = TrainCfg(epochs=cfg_ns.epochs, lr=cfg_ns.lr, batch_size=cfg_ns.bs)
+    # Initialize model configuration
+    if cfg_ns.demo_mode:
+        # Use toy data for testing
+        print("Running in demo mode with synthetic data")
+        model_cfg = ModelCfg(
+            input_size=1,  # Toy data is 1D
+            output_size=1,
+            hidden_size=cfg_ns.hidden,
+            num_layers=cfg_ns.layers,
+        )
+        train_cfg = TrainCfg(epochs=cfg_ns.epochs, lr=cfg_ns.lr, batch_size=cfg_ns.bs)
 
-    # toy 1‑D multi‑component data
-    x_sum, _ = sine_multi_component(
-        T=1500,
-        amplitudes=(0.8, 2.5, 4.0, 1.2),
-        omegas=(0.025, 0.050, 0.085, 0.140),
-        seed=cfg_ns.seed,
-        return_parts=True
-    )
-    ds = ToyDataset(x_sum, block_size=100)
-    loader = DataLoader(ds, batch_size=train_cfg.batch_size, shuffle=True)
+        # Generate synthetic data
+        x_sum, _ = sine_multi_component(
+            T=1500,
+            amplitudes=(0.8, 2.5, 4.0, 1.2),
+            omegas=(0.025, 0.050, 0.085, 0.140),
+            seed=cfg_ns.seed,
+            return_parts=True
+        )
+        ds = ToyDataset(x_sum, block_size=cfg_ns.sequence_length)
+        loader = DataLoader(ds, batch_size=train_cfg.batch_size, shuffle=True)
+        val_loader = loader  # In demo mode, use same loader for validation
+    else:
+        # Use VAE latent space
+        from src.worldmodels.models.vae import VAE
+        from src.worldmodels.data.latent_dataset import create_latent_dataloaders
 
-    model = MDN_LSTM(model_cfg).to("cuda" if torch.cuda.is_available() else "cpu")
-    print("Model params", sum(p.numel() for p in model.parameters()) / 1e6, "M")
+        # Load trained VAE
+        print(f"Loading VAE model from {cfg_ns.vae_path}")
+        vae_model = VAE.load_model(cfg_ns.vae_path, device)
+        print(f"VAE loaded with latent dimension: {vae_model.latent}")
+
+        # Create model config with VAE latent dimensions
+        model_cfg = ModelCfg(
+            input_size=vae_model.latent,
+            output_size=vae_model.latent,
+            hidden_size=cfg_ns.hidden,
+            num_layers=cfg_ns.layers,
+        )
+        train_cfg = TrainCfg(epochs=cfg_ns.epochs, lr=cfg_ns.lr, batch_size=cfg_ns.bs)
+
+        # Create latent sequence dataloaders
+        loader, val_loader = create_latent_dataloaders(
+            vae_model=vae_model,
+            data_root=cfg_ns.data_path,
+            batch_size=cfg_ns.bs,
+            cached_latents_path=cfg_ns.latent_cache,
+            device=device
+        )
+
+    # Create and train model
+    model = MDN_LSTM(model_cfg).to(device)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     train(model, loader, train_cfg)
-    sliding_window_predict_and_plot(
-        model,
-        ds.x,  # full raw sequence
-        t_warm_up=model.t_warm_up,
-        deterministic=True,
-        title="Demo fit on toy 1‑D data",
-    )
+
+    # Save the trained model
+    import os
+    os.makedirs(os.path.dirname(cfg_ns.model_save_path), exist_ok=True)
+    model.save_model(cfg_ns.model_save_path)
+    print(f"Model saved to {cfg_ns.model_save_path}")
+
+    # Visualize results
+    if cfg_ns.demo_mode:
+        # For toy data, use the existing plot function
+        sliding_window_predict_and_plot(
+            model,
+            ds.x,  # full raw sequence
+            deterministic=True,
+            title="Demo fit on toy 1-D data",
+        )
+    else:
+        # For VAE latents, visualize a few validation samples
+        from src.worldmodels.evaluation.rnn import visualize_latent_predictions
+        from src.worldmodels.utils.plotting import plot_latent_components
+
+        # Get a sample batch from validation
+        for x_batch, y_batch in val_loader:
+            sample_sequence = x_batch[0].to(device)  # Take first sequence
+            break
+
+        # Plot predictions for selected dimensions
+        visualize_latent_predictions(model, sample_sequence, dim_indices=(0, 1, 2))
+
+        # Also show the latent components over time
+        plot_latent_components(sample_sequence.cpu().numpy())
 
 
 if __name__ == "__main__":

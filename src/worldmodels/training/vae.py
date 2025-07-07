@@ -4,7 +4,7 @@ import torch
 from tqdm import tqdm
 
 from src.worldmodels.evaluation.vae import evaluate
-from src.worldmodels.utils import save_grid
+from src.worldmodels.utils.utils import save_grid
 
 
 def train(model, train_loader, test_loader, *, epochs: int, lr: float,
