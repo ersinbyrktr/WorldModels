@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-
+# models/vae.py
 from __future__ import annotations
 
 import argparse
@@ -175,8 +175,7 @@ def main():
     ap.add_argument("--outdir", type=str, default="world_models_elbo_outputs")
     ap.add_argument("--model-path", type=str, default="../../../trained_model",
                     help="Path to save/load model checkpoints")
-    ap.add_argument("--save-freq", type=int, default=100, help="Save model every N epochs")
-    ap.add_argument("--load-model", type=str, default="../../../trained_model/vae_checkpoint_ep1.pt",
+    ap.add_argument("--load-model", type=str, default="",
                     help="Path to load a pretrained model")
     args = ap.parse_args()
     torch.backends.cudnn.benchmark = True
@@ -202,8 +201,7 @@ def main():
           kl_on=not args.no_kl,
           warm=args.warm,
           outdir=args.outdir,
-          model_path=args.model_path,
-          save_freq=args.save_freq)
+          model_path=args.model_path)
 
 
 if __name__ == "__main__":

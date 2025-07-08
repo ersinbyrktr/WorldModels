@@ -6,78 +6,57 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
 
-from src.worldmodels.data.latent_dataset_episode import EpisodicLatentDataset
-from src.worldmodels.models.vae import VAE
 from src.worldmodels.utils.collate import pad_collate
 
+class EpisodicLatentActionDataset(Dataset):
+    """
+    Item = (x, y, L) where
+        x : (T-1, latent_dim + action_dim)  =  concat[z_t , a_t]
+        y : (T-1, latent_dim)              =  z_{t+1}
+        L : int  real length (T-1)
+    """
+    def __init__(self, latents, actions):
+        assert len(latents) == len(actions)
+        self.zs = [np.asarray(z, dtype=np.float32) for z in latents]
+        self.as_ = [np.asarray(a, dtype=np.float32) for a in actions]
 
-class LatentSequenceDataset(Dataset):
-    """Dataset for sequences of VAE-encoded latent vectors."""
-
-    def __init__(self, latent_sequences: np.ndarray, block_size: int):
-        """
-        Args:
-            latent_sequences: Array of shape (N, latent_dim) where N is total timesteps
-            block_size: Length of each sequence chunk
-        """
-        self.latents = torch.as_tensor(latent_sequences, dtype=torch.float32)
-        self.block_size = block_size
-
-    def __len__(self):
-        return len(self.latents) - self.block_size - 1
+    def __len__(self): return len(self.zs)
 
     def __getitem__(self, idx):
-        x = self.latents[idx: idx + self.block_size]  # Input sequence
-        y = self.latents[idx + 1: idx + self.block_size + 1]  # Target sequence (shifted by 1)
-        return x, y
+        z, a = self.zs[idx], self.as_[idx]
+        x = np.concatenate([z[:-1], a[:-1]], axis=1)   # concat along channel
+        y = z[1:]
+        L = x.shape[0]
+        return torch.from_numpy(x), torch.from_numpy(y), L
 
 
-class LatentSequenceDatasetV2(Dataset):
-    """Dataset for sequences of VAE-encoded latent vectors."""
+class EpisodicLatentDataset(Dataset):
+    """
+    Each item is the entire latent trajectory of one episode.
 
-    def __init__(self, latent_sequences: np.ndarray):
-        """
-        Args:
-            latent_sequences: Array of shape (N, latent_dim) where N is total timesteps
-        """
-        self.latents = torch.as_tensor(latent_sequences, dtype=torch.float32)
+    Args
+    ----
+    latents_per_episode : list[np.ndarray]
+        List length = #episodes.
+        Each array has shape (T, latent_dim) — *raw* VAE latents.
+    """
 
-    def __len__(self):
-        return 1
+    def __init__(self, latents_per_episode: list[np.ndarray]):
+        super().__init__()
+        self.seqs = [np.asarray(seq, dtype=np.float32) for seq in latents_per_episode]
+
+    def __len__(self) -> int:
+        return len(self.seqs)
 
     def __getitem__(self, idx):
-        x = self.latents[idx: idx + len(self.latents) - 1]  # Input sequence
-        y = self.latents[idx + 1: idx + len(self.latents)]  # Target sequence (shifted by 1)
-        return x, y
-
-
-def encode_image_sequences_to_latents(vae_model: VAE, image_dataloader: DataLoader, device: torch.device) -> np.ndarray:
-    """
-    Encode all images in the dataloader to latent representations.
-
-    Args:
-        vae_model: Trained VAE model
-        image_dataloader: DataLoader with image sequences
-        device: torch device
-
-    Returns:
-        np.ndarray: Array of latent vectors, shape (N, latent_dim)
-    """
-    vae_model.eval()
-    all_latents = []
-
-    with torch.no_grad():
-        for batch_images in tqdm(image_dataloader, desc="Encoding images to latents"):
-            batch_images = batch_images.to(device)
-            mu, _ = vae_model.encode(batch_images)
-            # Use mean of latent distribution (deterministic encoding)
-            latents = mu  # Shape: (batch_size, latent_dim)
-            all_latents.append(latents.cpu().numpy())
-
-    return np.concatenate(all_latents, axis=0)
+        z = self.seqs[idx]  # (T, C)
+        x = torch.from_numpy(z[:-1])  # (T-1, C)
+        y = torch.from_numpy(z[1:])  # (T-1, C)
+        L = x.shape[0]  # real length
+        return x, y, L  # -> collate_fn
 
 
 def create_rnn_latent_dataloaders(vae,
@@ -88,14 +67,14 @@ def create_rnn_latent_dataloaders(vae,
                                   num_workers=4,
                                   device=None):
     # ---- produce *list of arrays*, one per episode -----------------------
-    from .latent_utils import encode_episodes_to_latents  # or your own helper
-    episode_latents = encode_episodes_to_latents(vae,
-                                                 data_root,
-                                                 device=device)
 
-    split = int(len(episode_latents) * train_split)
-    train_ds = EpisodicLatentDataset(episode_latents[:split])
-    val_ds = EpisodicLatentDataset(episode_latents[split:])
+    from .latent_utils import encode_episodes_to_latents_actions
+    zs, acts = encode_episodes_to_latents_actions(vae, data_root, device=device)
+    split = int(len(zs) * train_split)
+    train_ds = EpisodicLatentActionDataset(zs[:split], acts[:split])
+    val_ds = EpisodicLatentActionDataset(zs[split:], acts[split:])
+
+    action_dim = acts[0].shape[1]
 
     train_dl = DataLoader(train_ds,
                           batch_size=batch_size,
@@ -111,4 +90,4 @@ def create_rnn_latent_dataloaders(vae,
                         pin_memory=True,
                         collate_fn=pad_collate)
 
-    return train_dl, val_dl
+    return train_dl, val_dl, action_dim

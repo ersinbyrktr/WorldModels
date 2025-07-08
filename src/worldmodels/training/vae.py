@@ -1,3 +1,4 @@
+# training/vae.py
 import os
 
 import torch
@@ -8,8 +9,7 @@ from src.worldmodels.utils.utils import save_grid
 
 
 def train(model, train_loader, test_loader, *, epochs: int, lr: float,
-          beta: float, kl_on: bool, warm: int, outdir: str, model_path: str = None,
-          save_freq: int = 10):
+          beta: float, kl_on: bool, warm: int, outdir: str, model_path: str = None):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(dev)
     os.makedirs(outdir, exist_ok=True)
@@ -77,11 +77,8 @@ def train(model, train_loader, test_loader, *, epochs: int, lr: float,
         save_grid(recon_grid, f"{outdir}/recon_ep{ep}.png", nrow=8)
 
         # Save model checkpoint
-        if (ep % save_freq == 0 or ep == epochs):
-            checkpoint_path = os.path.join(model_path, f"vae_checkpoint_ep{ep}.pt")
-            model.save_model(checkpoint_path)
-            print(f"Model saved to {checkpoint_path}")
-
+        if ep == epochs:
             # Save latest model for easy loading
             latest_path = os.path.join(model_path, "vae_latest.pt")
             model.save_model(latest_path)
+            print(f"VAE Model saved to {latest_path}")

@@ -8,8 +8,6 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.optim.lr_scheduler import StepLR
 
-from src.worldmodels.evaluation.batch_eval import evaluate
-
 
 @dataclass
 class TrainCfg:
@@ -36,7 +34,8 @@ def train(model, loader, cfg):
 
         for xb, yb, lens in loader:  # xb : (B,Tmax,C)
             xb, yb, lens = xb.to(dev), yb.to(dev), lens.to(dev)
-            B, Tmax, C = xb.shape
+            B, Tmax, Cin = xb.shape
+            Cout = yb.shape[2]
 
             # sort lengths ↓ for pack; restore order later if you want
             lens, sort_idx = lens.sort(descending=True)
@@ -53,18 +52,18 @@ def train(model, loader, cfg):
 
             wl, mu, ls = model.mdn(out.reshape(-1, model.hidden_size))
             wl = wl.reshape(B, Tmax, -1)
-            mu = mu.reshape(B, Tmax, model.cfg.num_gaussians, C)
+            mu = mu.reshape(B, Tmax, model.cfg.num_gaussians, Cout)
             ls = ls.reshape_as(mu)
 
             # ---------- mask away the padding -----------------------------
             mask = (torch.arange(Tmax, device=dev)[None, :] < lens[:, None])  # (B,T)
             mask_f = mask.reshape(-1)  # (B*T)
 
-            target = yb.reshape(-1, C)[mask_f]
+            target = yb.reshape(-1, Cout)[mask_f]
             out_kw = {
                 "weight_logits": wl.reshape(-1, model.cfg.num_gaussians)[mask_f],
-                "means": mu.reshape(-1, model.cfg.num_gaussians, C)[mask_f],
-                "log_stds": ls.reshape(-1, model.cfg.num_gaussians, C)[mask_f],
+                "means": mu.reshape(-1, model.cfg.num_gaussians, Cout)[mask_f],
+                "log_stds": ls.reshape(-1, model.cfg.num_gaussians, Cout)[mask_f],
             }
             loss = model.loss(target, **out_kw)
 

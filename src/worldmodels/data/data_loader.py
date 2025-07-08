@@ -49,7 +49,7 @@ class WorldModelsFrames(Dataset):
               flush=True)
 
         # ---------- gather metadata only (no memmaps kept) ------------------
-        self.npy_files: list[Path] = sorted(self.root.glob("*.npy"))
+        self.npy_files: list[Path] = sorted(self.root.glob("*_obs.npy"))
         if not self.npy_files:
             raise RuntimeError(f"No .npy files found in {self.root}")
 

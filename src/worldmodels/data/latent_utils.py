@@ -1,29 +1,43 @@
 # latent_utils.py ------------------------------------------------------------
 from pathlib import Path
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-def encode_episodes_to_latents(vae, root: Path, device, batch=64) -> list[np.ndarray]:
+
+def _matching_actions_file(obs_file: Path) -> Path:
+    return obs_file.with_name(obs_file.name.replace("_obs.npy", "_actions.npy"))
+
+
+def encode_episodes_to_latents_actions(vae, root: Path, device, batch=64) \
+        -> tuple[list[np.ndarray], list[np.ndarray]]:
     """
-    Returns a list whose i-th element is a (Ti, latent_dim) array –
-    the VAE latents for episode i.
+    Returns two lists (latents, actions) with equal length == #episodes.
+      • latents[i]  : (Ti, latent_dim)
+      • actions[i]  : (Ti, action_dim)
     """
     root = Path(root)
-    latents_per_episode: list[np.ndarray] = []
+    L, A = [], []
 
-    for npy in sorted(root.glob("*.npy")):          # ← 1 file == 1 episode
-        frames = np.load(npy)                       # (T,H,W,3) uint8
-        frames = torch.as_tensor(frames).permute(0,3,1,2).float() / 255.
+    for obs_file in sorted(root.glob("*_obs.npy")):
+        act_file = _matching_actions_file(obs_file)
+        frames = np.load(obs_file)  # (T,H,W,3) uint8
+        actions = np.load(act_file).astype(np.float32)  # (T, action_dim)
+
+        frames = torch.as_tensor(frames).permute(0, 3, 1, 2).float() / 255.
         dl = DataLoader(frames, batch_size=batch, shuffle=False)
 
-        episode_latents = []
+        ep_lat = []
         with torch.no_grad():
             for imgs in dl:
                 imgs = imgs.to(device)
-                mu, _ = vae.encode(imgs)            # (B, latent_dim)
-                episode_latents.append(mu.cpu().numpy())
+                mu, _ = vae.encode(imgs)
+                ep_lat.append(mu.cpu().numpy())
 
-        latents_per_episode.append(np.concatenate(episode_latents, axis=0))
+        lat_arr = np.concatenate(ep_lat, axis=0)  # (T, latent_dim)
+        assert lat_arr.shape[0] == actions.shape[0], f"Length mismatch in {obs_file}"
 
-    return latents_per_episode          # length = #episodes
+        L.append(lat_arr)
+        A.append(actions)
+    return L, A

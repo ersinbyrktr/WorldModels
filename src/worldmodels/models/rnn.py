@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 from dataclasses import dataclass
-from typing import Sequence, Tuple, Optional
+from typing import Tuple, Sequence, Optional
 
 import numpy as np
 import torch
@@ -124,25 +125,46 @@ class MDN_LSTM(nn.Module):
     loss = staticmethod(mdn_loss)
     predict = staticmethod(mdn_predict)
 
-    def save_model(self, path):
+    def save_model(self, path: str | os.PathLike):
         """Save model state to disk"""
-        import os
+        import os, dataclasses
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        cfg_dict = dataclasses.asdict(self.cfg)
         torch.save({
             'model_state_dict': self.state_dict(),
-            'model_config': self.cfg
+            'model_config': cfg_dict
         }, path)
 
     @classmethod
-    def load_model(cls, path, device=None):
-        """Load a saved model from disk"""
+    def load_model(cls, path: str | os.PathLike, device=None):
+        """
+            Robust checkpoint loader.
+            • First tries `weights_only=False` (full pickle) to support *old*
+              checkpoints that stored a dataclass instance.
+            • Falls back to `weights_only=True` if the checkpoint was saved
+              with the new (dict) format.
+        """
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        checkpoint = torch.load(path, map_location=device)
-        model = cls(checkpoint['model_config'])
-        model.load_state_dict(checkpoint['model_state_dict'])
+        try:
+            ckpt = torch.load(path, map_location=device, weights_only=False)
+        except Exception:
+            # Newer, safe format (dicts only) – no need for full pickle
+            ckpt = torch.load(path, map_location=device, weights_only=True)
+
+        cfg_raw = ckpt["model_config"]
+
+        if isinstance(cfg_raw, dict):
+            cfg = ModelCfg(**cfg_raw)
+        else:
+            # Legacy checkpoint contained the dataclass instance
+            cfg = cfg_raw
+
+        model = cls(cfg)
+        model.load_state_dict(ckpt["model_state_dict"])
         model.to(device)
+
         return model
 
 
@@ -155,7 +177,7 @@ def main(args: Optional[Sequence[str]] = None):
     # basic hyper‑params
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--layers", type=int, default=1)
-    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--epochs", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--bs", type=int, default=512)
     p.add_argument("--seed", type=int, default=0)
@@ -167,8 +189,12 @@ def main(args: Optional[Sequence[str]] = None):
                    help="Path to image data directory")
     p.add_argument("--sequence-length", type=int, default=100,
                    help="Length of sequences for RNN training")
-    p.add_argument("--model-save-path", type=str, default="../../../trained_models/rnn_model.pt",
+    p.add_argument("--model-save-path", type=str, default="../../../trained_model/rnn_model.pt",
                    help="Path to save the trained model")
+    p.add_argument("--load-model", type=str, default="../../../trained_model/rnn_model.pt",
+                   help="Path to a previously-trained RNN checkpoint (.pt). "
+                        "If given, the model will be loaded instead of "
+                        "initialised from scratch.")
 
     cfg_ns = p.parse_args(args)
 
@@ -186,50 +212,57 @@ def main(args: Optional[Sequence[str]] = None):
     print(f"VAE loaded with latent dimension: {vae_model.latent}")
 
     # Create model config with VAE latent dimensions
-    model_cfg = ModelCfg(
-        input_size=vae_model.latent,
-        output_size=vae_model.latent,
-        hidden_size=cfg_ns.hidden,
-        num_layers=cfg_ns.layers,
-    )
-    train_cfg = TrainCfg(epochs=cfg_ns.epochs, lr=cfg_ns.lr, batch_size=cfg_ns.bs)
-
-    # Create latent sequence dataloaders
-    loader, val_loader = create_rnn_latent_dataloaders(
+    train_dl, val_dl, action_dim = create_rnn_latent_dataloaders(
         vae=vae_model,
         data_root=cfg_ns.data_path,
         num_workers=cfg_ns.workers,
-        # batch_size=cfg_ns.bs,
         device=device
     )
+    if cfg_ns.load_model:
+        from pathlib import Path
+        ckpt_path = Path(cfg_ns.load_model).expanduser()
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"--load-model file not found: {ckpt_path}")
+        print(f"Loading RNN model from {ckpt_path}")
+        model = MDN_LSTM.load_model(str(ckpt_path), device)
+    else:
+        model_cfg = ModelCfg(
+            input_size=vae_model.latent + action_dim,
+            output_size=vae_model.latent,
+            hidden_size=cfg_ns.hidden,
+            num_layers=cfg_ns.layers,
+        )
+        model = MDN_LSTM(model_cfg).to(device)
+        print("Initialised new RNN model")
 
-    # Create and train model
-    model = MDN_LSTM(model_cfg).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-    train(model, loader, train_cfg)
 
-    # Save the trained model
-    import os
-    os.makedirs(os.path.dirname(cfg_ns.model_save_path), exist_ok=True)
-    model.save_model(cfg_ns.model_save_path)
-    print(f"Model saved to {cfg_ns.model_save_path}")
+    train_cfg = TrainCfg(epochs=cfg_ns.epochs, lr=cfg_ns.lr, batch_size=cfg_ns.bs)
+    loader, val_loader = train_dl, val_dl
+
+    if train_cfg.epochs > 0:
+        train(model, loader, train_cfg)
+
+        # Save the trained model
+        import os
+        os.makedirs(os.path.dirname(cfg_ns.model_save_path), exist_ok=True)
+        model.save_model(cfg_ns.model_save_path)
+        print(f"Model saved to {cfg_ns.model_save_path}")
+    else:
+        print("Skipping training")
 
     # Visualize results
 
     # For VAE latents, visualize a few validation samples
-    from src.worldmodels.utils.plotting import plot_latent_components
     from src.worldmodels.evaluation.rnn import visualize_latent_predictions
-    val_nll = evaluate(model, val_loader)
+    val_nll = evaluate(model, loader)
     print(f"Validation NLL / frame: {val_nll:.4f}")
     # Get a sample batch from validation
-    xb, _, _ = next(iter(val_loader))  # xb : (B,Tmax,C) with padding
-    sample_sequence = xb[0].to(device)  # pick first episode in the batch
+    xb, yb, _ = next(iter(loader))  # xb : (B,Tmax,C) with padding
+    sample_x = xb[0].to(device)
+    sample_y = yb[0].to(device)
 
-    # Plot predictions for selected dimensions
-    visualize_latent_predictions(model, sample_sequence, dim_indices=(0, 1, 2))
-
-    # Also show the latent components over time
-    plot_latent_components(sample_sequence.cpu().numpy())
+    visualize_latent_predictions(model, sample_x, sample_y, dim_indices=(0, 1, 2, 3, 4, 5, 6))
 
 
 if __name__ == "__main__":

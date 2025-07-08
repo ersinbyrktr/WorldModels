@@ -23,9 +23,14 @@ def evaluate_latent_prediction(model: MDN_LSTM, val_loader: DataLoader, device: 
     total_loss = 0.0
     count = 0
 
-    for x_batch, y_batch in val_loader:
-        x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-        batch_size, seq_len, latent_dim = x_batch.shape
+    for x_batch, y_batch, lens in val_loader:
+        x_batch, y_batch, lens = (
+            x_batch.to(device),
+            y_batch.to(device),
+            lens.to(device),
+        )
+        batch_size, seq_len, _ = x_batch.shape
+        latent_dim = y_batch.shape[2]
 
         # Initialize hidden state
         h = (
@@ -42,13 +47,24 @@ def evaluate_latent_prediction(model: MDN_LSTM, val_loader: DataLoader, device: 
             out["ls"].append(ls)
 
         # Calculate loss
-        out = {
-            "weight_logits": torch.stack(out["wl"], 1).reshape(batch_size * seq_len, -1),
-            "means": torch.stack(out["mu"], 1).reshape(batch_size * seq_len, model.cfg.num_gaussians, latent_dim),
-            "log_stds": torch.stack(out["ls"], 1).reshape(batch_size * seq_len, model.cfg.num_gaussians, latent_dim),
-        }
+        wl = torch.stack(out["wl"], 1)  # (B,T,K)
+        mu = torch.stack(out["mu"], 1)  # (B,T,K,C)
+        ls = torch.stack(out["ls"], 1)
+
+        wl = wl.reshape(batch_size * seq_len, -1)
+        mu = mu.reshape(batch_size * seq_len, model.cfg.num_gaussians, latent_dim)
+        ls = ls.reshape_as(mu)
         target = y_batch.reshape(batch_size * seq_len, latent_dim)
-        loss = model.loss(target, **out)
+
+        # mask padded timesteps
+        mask = (torch.arange(seq_len, device=device)[None, :] < lens[:, None]).reshape(-1)
+
+        loss = model.loss(
+            target[mask],
+            weight_logits=wl[mask],
+            means=mu[mask],
+            log_stds=ls[mask],
+        )
 
         total_loss += loss.item() * batch_size
         count += batch_size
@@ -57,7 +73,8 @@ def evaluate_latent_prediction(model: MDN_LSTM, val_loader: DataLoader, device: 
 
 
 @torch.no_grad()
-def visualize_latent_predictions(model: MDN_LSTM, latent_sequence: torch.Tensor, dim_indices=(0, 1, 2)):
+def visualize_latent_predictions(model: MDN_LSTM, x_sequence: torch.Tensor, y_sequence: torch.Tensor | None = None,
+                                 dim_indices=(0, 1, 2, 32, 33, 34)):
     """Visualize the prediction of the RNN on a latent sequence.
 
     Args:
@@ -69,10 +86,12 @@ def visualize_latent_predictions(model: MDN_LSTM, latent_sequence: torch.Tensor,
     device = next(model.parameters()).device
 
     # Ensure (T, latent_dim) float32 on device
-    latent_sequence = torch.as_tensor(latent_sequence, dtype=torch.float32, device=device)
-    if latent_sequence.ndim == 1:
-        latent_sequence = latent_sequence.unsqueeze(-1)
-    T, latent_dim = latent_sequence.shape
+    x_sequence = torch.as_tensor(x_sequence, dtype=torch.float32, device=device)
+    if y_sequence is not None:
+        y_sequence = torch.as_tensor(y_sequence, dtype=torch.float32, device=device)
+
+    T, Cin = x_sequence.shape
+    latent_dim = model.cfg.output_size
 
     # Get predictions
     preds = []
@@ -82,7 +101,7 @@ def visualize_latent_predictions(model: MDN_LSTM, latent_sequence: torch.Tensor,
     )
     h = tuple(x.clone() for x in h0)
     for t in range(T):
-        wl, mu, ls, h = model(latent_sequence[t:t + 1], h)
+        wl, mu, ls, h = model(x_sequence[t:t + 1], h)
         y_hat = model.predict(wl, mu, ls, deterministic=True)  # (1, latent_dim)
         preds.append(y_hat.squeeze(0).cpu())
 
@@ -99,7 +118,10 @@ def visualize_latent_predictions(model: MDN_LSTM, latent_sequence: torch.Tensor,
         ax = axes[i]
 
         # Plot ground truth
-        ax.plot(t, _np(latent_sequence)[:, dim_idx], label="ground truth", lw=1.2)
+        if y_sequence is not None:
+            ax.plot(t, _np(y_sequence.cpu())[:, dim_idx], label="ground truth", lw=1.2)
+        else:
+            ax.plot(t, _np(x_sequence.cpu())[:, dim_idx], label="ground truth", lw=1.2)
 
         # Plot prediction
         ax.plot(t, _np(preds)[:, dim_idx], label="prediction", lw=1.2)

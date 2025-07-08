@@ -13,7 +13,8 @@ def evaluate(model, loader):
 
     for xb, yb, lens in loader:                # xb: (B,Tmax,C)
         xb, yb, lens = xb.to(dev), yb.to(dev), lens.to(dev)
-        B, Tmax, C   = xb.shape
+        B, Tmax, Cin = xb.shape
+        Cout = yb.shape[2]
 
         lens, sort_idx = lens.sort(descending=True)
         xb, yb = xb[sort_idx], yb[sort_idx]
@@ -32,17 +33,17 @@ def evaluate(model, loader):
 
         wl, mu, ls = model.mdn(out.reshape(-1, model.hidden_size))
         wl = wl.reshape(B, Tmax, -1)
-        mu = mu.reshape(B, Tmax, model.cfg.num_gaussians, C)
+        mu = mu.reshape(B, Tmax, model.cfg.num_gaussians, Cout)
         ls = ls.reshape_as(mu)
 
         mask    = (torch.arange(Tmax, device=dev)[None, :] < lens[:, None])
         mask_f  = mask.reshape(-1)
 
-        target  = yb.reshape(-1, C)[mask_f]
+        target  = yb.reshape(-1, Cout)[mask_f]
         out_kw  = {
             "weight_logits": wl.reshape(-1, model.cfg.num_gaussians)[mask_f],
-            "means":         mu.reshape(-1, model.cfg.num_gaussians, C)[mask_f],
-            "log_stds":      ls.reshape(-1, model.cfg.num_gaussians, C)[mask_f],
+            "means":         mu.reshape(-1, model.cfg.num_gaussians, Cout)[mask_f],
+            "log_stds":      ls.reshape(-1, model.cfg.num_gaussians, Cout)[mask_f],
         }
         loss = model.loss(target, **out_kw)
 

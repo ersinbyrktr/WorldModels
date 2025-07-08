@@ -30,9 +30,9 @@ def main(
 
     # ------------- bookkeeping ----------------------------------------------
     step_counters = np.zeros(workers, dtype=np.int32)
-    episode_buffers = [[] for _ in range(workers)]  # NEW
+    episode_buffers = [[] for _ in range(workers)]
+    action_buffers = [[] for _ in range(workers)]
     episode_count = 0
-    frame_count = 0
     # ------------- rollout loop ---------------------------------------------
     with trange(episodes, desc="Episodes") as pbar:
         steer_bias = random.uniform(-0.1, 0.5)
@@ -62,15 +62,22 @@ def main(
             # -------- collect frames ----------------------------------------
             for i, ob in enumerate(obs):
                 episode_buffers[i].append(resize64(ob))
+                # Also store the action that led to this observation
+                action_buffers[i].append(actions[i])  # actions[i] is shape (3,)
+
                 step_counters[i] += 1
 
                 if done[i]:
                     # -------- flush this entire episode in one shot ----------
-                    ep_arr = np.asarray(episode_buffers[i], dtype=np.uint8)
-                    np.save(out / f"episode_{episode_count:05d}.npy", ep_arr)
-                    frame_count += len(ep_arr)
-                    # reset per-env counters & buffer
+                    ep_obs = np.asarray(episode_buffers[i], dtype=np.uint8)
+                    ep_actions = np.asarray(action_buffers[i], dtype=np.float32)
+
+                    np.save(out / f"episode_{episode_count:05d}_obs.npy", ep_obs)
+                    np.save(out / f"episode_{episode_count:05d}_actions.npy", ep_actions)
+
                     episode_buffers[i].clear()
+                    action_buffers[i].clear()
+
                     step_counters[i] = 0
                     episode_count += 1
                     pbar.update(1)
