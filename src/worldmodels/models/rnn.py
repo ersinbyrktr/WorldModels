@@ -138,33 +138,54 @@ class MDN_LSTM(nn.Module):
     @classmethod
     def load_model(cls, path: str | os.PathLike, device=None):
         """
-            Robust checkpoint loader.
-            • First tries `weights_only=False` (full pickle) to support *old*
-              checkpoints that stored a dataclass instance.
-            • Falls back to `weights_only=True` if the checkpoint was saved
-              with the new (dict) format.
-        """
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        Load an MDN-LSTM checkpoint saved in either OLD (pickled dataclass)
+        or NEW (dict-only) format, regardless of where `ModelCfg` lived.
 
+        • First we inject `ModelCfg` into `__main__` so legacy pickles that
+          reference  __main__.ModelCfg  can resolve it.
+        • Then we *try* the new safer route  (weights_only=True)  with an
+          explicit allow-list (`safe_globals`).
+        • If that still fails, we fall back to  weights_only=False  (full
+          unpickle) – but only after allow-listing the class.
+        """
+        import __main__, torch.serialization as _ser
+
+        if device is None:
+            device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+
+        # Make sure legacy pickles can resolve  __main__.ModelCfg
+        setattr(__main__, "ModelCfg", ModelCfg)
+
+        safe = {
+            "ModelCfg": ModelCfg,
+            "__main__.ModelCfg": ModelCfg,
+            "src.worldmodels.models.rnn.ModelCfg": ModelCfg,
+        }
+
+        # 1) Preferred: dict-only checkpoint (no arbitrary code)
         try:
-            ckpt = torch.load(path, map_location=device, weights_only=False)
+            ckpt = torch.load(
+                path,
+                map_location=device,
+                weights_only=True,
+                safe_globals=safe,
+            )
         except Exception:
-            # Newer, safe format (dicts only) – no need for full pickle
-            ckpt = torch.load(path, map_location=device, weights_only=True)
+            # 2) Legacy: full pickle (we still keep it safe by allow-listing)
+            _ser.add_safe_globals(safe)
+            ckpt = torch.load(
+                path,
+                map_location=device,
+                weights_only=False,  # full pickle
+            )
 
         cfg_raw = ckpt["model_config"]
+        cfg = ModelCfg(**cfg_raw) if isinstance(cfg_raw, dict) else cfg_raw
 
-        if isinstance(cfg_raw, dict):
-            cfg = ModelCfg(**cfg_raw)
-        else:
-            # Legacy checkpoint contained the dataclass instance
-            cfg = cfg_raw
-
-        model = cls(cfg)
+        model = cls(cfg).to(device)
         model.load_state_dict(ckpt["model_state_dict"])
-        model.to(device)
-
         return model
 
 
