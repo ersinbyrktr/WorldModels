@@ -21,7 +21,9 @@ import time
 import cma
 import numpy as np
 import torch
+from gymnasium import Env
 
+from src.worldmodels.envs.carracing import make_env
 from src.worldmodels.models.controller import (
     PolicyNet,
     _params_to_vector,
@@ -140,9 +142,7 @@ def run() -> None:
     #  Retrieve & test best controller
     # ────────────────────────────────────────────────────────────────────────────────
 
-    import gymnasium as gym
-
-    env_test = gym.make("CarRacing-v3", render_mode="human" if args.render else None)
+    env_test: Env = make_env(render_mode="human" if args.render else None)()
     obs, _ = env_test.reset()
     vae_eval, rnn_eval = _load_models(args.vae_path, args.rnn_path, torch.device("cpu"))
     h_eval = (

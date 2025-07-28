@@ -16,11 +16,11 @@ import os
 from dataclasses import dataclass, asdict
 
 import cv2
-import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 
+from src.worldmodels.envs.carracing import make_env
 from src.worldmodels.models.rnn import MDN_LSTM
 from src.worldmodels.models.vae import VAE
 
@@ -127,7 +127,7 @@ class PolicyNet(nn.Module):
 
         rewards: list[float] = []
         for _ in range(rollouts_per_eval):
-            env = gym.make("CarRacing-v3", render_mode=None)
+            env = make_env()()
             if env_seed is not None:
                 env.reset(seed=env_seed)
 
