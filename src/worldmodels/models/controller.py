@@ -1,5 +1,5 @@
 """
-Controller for a World-Models CarRacing agent.
+Controller for a World-Models agent.
 
 The policy receives the VAE latent vector **z_t** (dim = VAE.latent) and the
 top-layer LSTM hidden state **h_t** (dim = RNN.hidden_size).  It outputs a
@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src.worldmodels.envs.carracing import make_env
+import src.worldmodels.envs.bipedal_walker as BipedalWalkerEnv
 from src.worldmodels.models.rnn import MDN_LSTM
 from src.worldmodels.models.vae import VAE
 
@@ -43,6 +43,27 @@ def _vector_to_params(net: nn.Module, vec: np.ndarray) -> None:
         block = vec[idx: idx + numel].reshape(p.shape)
         p.data = torch.from_numpy(block).float()
         idx += numel
+
+
+def _looks_like_image(arr: np.ndarray) -> bool:
+    if arr.ndim == 3 and (arr.shape[-1] in (1, 3, 4) or arr.shape[0] in (1, 3, 4)):
+        return True
+    if arr.ndim == 2:
+        return True
+    return False
+
+
+def _obs_to_frame(env, obs: np.ndarray) -> np.ndarray:
+    """Return an HWC image frame for the current state."""
+    if isinstance(obs, np.ndarray) and _looks_like_image(obs):
+        return obs
+    # Otherwise, fall back to renderer (requires render_mode="rgb_array")
+    frame = env.render()
+    if frame is None:
+        raise RuntimeError(
+            "env.render() returned None. Create env with render_mode='rgb_array'."
+        )
+    return frame
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -140,7 +161,7 @@ class PolicyNet(nn.Module):
             env_seed: int | None = None,
     ) -> float:
         """
-        Evaluate one controller in CarRacing-v3.
+        Evaluate one controller
 
         Returns **negative** average reward so that CMA-ES (which minimises)
         can be used directly.
@@ -150,18 +171,18 @@ class PolicyNet(nn.Module):
         latent_dim = vae.latent
         hidden_dim = rnn.hidden_size
 
-        policy = cls(input_size=latent_dim + hidden_dim)
+        policy = cls(input_size=latent_dim + hidden_dim, action_bounds=BipedalWalkerEnv.action_space)
         _vector_to_params(policy, policy_params)
         policy.eval()
 
         rewards: list[float] = []
         for _ in range(rollouts_per_eval):
-            env = make_env()()
+            # OPTIONAL but clearer: ensure render_mode returns RGB arrays
+            env = BipedalWalkerEnv.make_env(render_mode="rgb_array")()  # ← change (optional)
             if env_seed is not None:
                 env.reset(seed=env_seed)
 
             obs, _ = env.reset()
-            # LSTM hidden state (h, c) each: (layers=1, batch=1, hidden_dim)
             h = (
                 torch.zeros(rnn.cfg.num_layers, 1, hidden_dim, device=dev),
                 torch.zeros(rnn.cfg.num_layers, 1, hidden_dim, device=dev),
@@ -170,20 +191,21 @@ class PolicyNet(nn.Module):
             ep_reward, done = 0.0, False
             while not done:
                 # (1) frame → latent z_t
+                frame = _obs_to_frame(env, obs)  # ← NEW
                 with torch.no_grad():
-                    z_t = _encode_frame(obs, vae, dev)
+                    z_t = _encode_frame(frame, vae, dev)  # ← replace obs → frame
 
                 # (2) controller input & action
-                h_flat = h[0][-1, 0]  # take last LSTM layer, batch-dim squeezed → (hidden_dim,)
+                h_flat = h[0][-1, 0]
                 ctrl_in = torch.cat([z_t, h_flat], dim=0).detach().cpu().numpy()
-                a = policy.act(ctrl_in)  # (3,)
+                a = policy.act(ctrl_in)
 
                 # (3) env step
                 obs, reward, term, trunc, _ = env.step(a)
                 done = term or trunc
                 ep_reward += reward
 
-                # (4) update RNN hidden:  (z_t, a_t) → h_{t+1}
+                # (4) update RNN hidden
                 za_t = torch.cat([z_t, torch.from_numpy(a).to(dev)], dim=0).unsqueeze(0)
                 _, _, _, h = rnn(za_t, h)
 
@@ -241,16 +263,52 @@ def _load_models(vae_path: str, rnn_path: str, device: torch.device):
     return _CACHED_MODELS[key]
 
 
-def _encode_frame(frame: np.ndarray, vae: VAE, device: torch.device) -> torch.Tensor:
+def _encode_frame(img: np.ndarray, vae, device: torch.device) -> torch.Tensor:
     """
-    Resize a raw CarRacing frame to 64×64, normalise to [0,1],
-    encode via the VAE, and return μ as a 1-D tensor on *device*.
+    Accepts a frame in common layouts and returns z_t (latent from VAE).
+
+    Accepts:
+      - HWC RGB/RGBA  (H, W, 3/4)
+      - CHW RGB/RGBA  (3/4, H, W)
+      - Grayscale     (H, W)       -> replicated to 3 channels
+
+    Resizes to 64x64 (if your VAE was trained on 64x64) and converts to [0,1] float.
     """
-    img = cv2.resize(frame, (64, 64), interpolation=cv2.INTER_LINEAR)
+
+    img = np.asarray(img)
+
+    # ---- Normalize layout to HWC, 3 channels
+    if img.ndim == 2:
+        # grayscale HxW -> HxWx3
+        img = np.repeat(img[..., None], 3, axis=-1)
+    elif img.ndim == 3:
+        # CHW -> HWC
+        if img.shape[0] in (1, 3, 4) and img.shape[-1] not in (3, 4):
+            img = np.moveaxis(img, 0, -1)
+        # RGBA -> RGB
+        if img.shape[-1] == 4:
+            img = img[..., :3]
+        elif img.shape[-1] == 1:
+            img = np.repeat(img, 3, axis=-1)
+    else:
+        raise ValueError(f"_encode_frame: unsupported input shape {img.shape}")
+
+    # ---- Ensure uint8 HWC 64x64x3
+    if img.dtype != np.uint8:
+        # If 0..1 floats, scale to 0..255; otherwise clip
+        vmin, vmax = float(np.min(img)), float(np.max(img))
+        if 0.0 <= vmin and vmax <= 1.0:
+            img = (img * 255.0).clip(0, 255).astype(np.uint8)
+        else:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+
+    if img.shape[:2] != (64, 64):
+        img = cv2.resize(img, (64, 64), interpolation=cv2.INTER_LINEAR)
+
     x = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
     with torch.no_grad():
-        mu, _ = vae.encode(x)
-    return mu.squeeze(0)  # (latent_dim,)
+        z_mu, _ = vae.encode(x)  # adjust if your VAE API differs
+    return z_mu.squeeze(0)
 
 
 # Expose helpers for the training script

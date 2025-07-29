@@ -1,5 +1,5 @@
 """
-Parallel CMA-ES training script for the World-Models CarRacing controller.
+Parallel CMA-ES training script for the World-Models controller.
 
 Each worker process constructs its own VAE + RNN (loaded from checkpoints)
 and a PolicyNet whose parameters are supplied by CMA-ES.  Fitness = negative
@@ -23,13 +23,14 @@ import numpy as np
 import torch
 from gymnasium import Env
 
-import src.worldmodels.envs.carracing as CarracingEnv
+import src.worldmodels.envs.bipedal_walker as BipedalWalkerEnv
 from src.worldmodels.models.controller import (
     PolicyNet,
     _params_to_vector,
     _vector_to_params,
     _load_models,
     _encode_frame,
+    _obs_to_frame
 )
 
 
@@ -37,20 +38,20 @@ def run() -> None:
     # ────────────────────────────────────────────────────────────────────────────────
     #  CLI
     # ────────────────────────────────────────────────────────────────────────────────
-    parser = argparse.ArgumentParser(description="Parallel CMA-ES on CarRacing-v3")
-    parser.add_argument("--vae-path", default="../../../trained_model/vae_latest.pt",
+    parser = argparse.ArgumentParser(description="Parallel CMA-ES")
+    parser.add_argument("--vae-path", default="../../../trained_bipedal_model/vae_latest.pt",
                         help="Path to trained VAE (.pt)")
-    parser.add_argument("--rnn-path", default="../../../trained_model/rnn_model.pt",
+    parser.add_argument("--rnn-path", default="../../../trained_bipedal_model/rnn_model.pt",
                         help="Path to trained RNN (.pt)")
     parser.add_argument("--popsize", type=int, default=16, help="CMA population λ")
     parser.add_argument("--sigma0", type=float, default=0.1, help="Initial CMA σ₀")
     parser.add_argument("--rollouts", type=int, default=4, help="Episodes per evaluation")
-    parser.add_argument("--maxiter", type=int, default=0, help="Max CMA generations")
-    parser.add_argument("--workers", type=int, default=16, help="# CPU workers")
-    parser.add_argument("--render", action="store_true", default=True, help="Render a final greedy run")
-    parser.add_argument("--save-model", default="../../../trained_model/controller_best.pt",
+    parser.add_argument("--maxiter", type=int, default=50, help="Max CMA generations")
+    parser.add_argument("--workers", type=int, default=8, help="# CPU workers")
+    parser.add_argument("--render", action="store_true", default=False, help="Render a final greedy run")
+    parser.add_argument("--save-model", default="../../../trained_bipedal_model/controller_best.pt",
                         help="Path to save best controller (.pt)")
-    parser.add_argument("--load-model", default="../../../trained_model/controller_best_891.pt",
+    parser.add_argument("--load-model", default="",  # "../../../trained_bipedal_model/controller_best_891.pt"
                         help="Path to an existing controller to resume / evaluate")
 
     args = parser.parse_args()
@@ -73,7 +74,7 @@ def run() -> None:
         print(f"[init] Loading controller from {args.load_model}")
         seed_policy = PolicyNet.load_model(args.load_model, device="cpu")
     else:
-        seed_policy = PolicyNet(input_size=CTRL_IN_DIM, action_bounds=CarracingEnv.action_space)
+        seed_policy = PolicyNet(input_size=CTRL_IN_DIM, action_bounds=BipedalWalkerEnv.action_space)
     x0 = _params_to_vector(seed_policy)
 
     cma_opts: dict[str, int] = {}
@@ -130,7 +131,7 @@ def run() -> None:
 
     # ------------------------------------------------------------------ determine the best policy ---
     print(f"\n[save] Writing best controller to {args.save_model}")
-    best_policy = PolicyNet(input_size=CTRL_IN_DIM, action_bounds=CarracingEnv.action_space)
+    best_policy = PolicyNet(input_size=CTRL_IN_DIM, action_bounds=BipedalWalkerEnv.action_space)
     _vector_to_params(best_policy, best_vec_global)
 
     if args.maxiter > 0:
@@ -142,7 +143,7 @@ def run() -> None:
     #  Retrieve & test best controller
     # ────────────────────────────────────────────────────────────────────────────────
 
-    env_test: Env = CarracingEnv.make_env(render_mode="human" if args.render else None)()
+    env_test: Env = BipedalWalkerEnv.make_env(render_mode="rgb_array")()
     obs, _ = env_test.reset()
     vae_eval, rnn_eval = _load_models(args.vae_path, args.rnn_path, torch.device("cpu"))
     h_eval = (
@@ -152,7 +153,8 @@ def run() -> None:
 
     tot_reward, done = 0.0, False
     while not done:
-        z_eval = _encode_frame(obs, vae_eval, torch.device("cpu"))
+        frame = _obs_to_frame(env_test, obs)
+        z_eval = _encode_frame(frame, vae_eval, torch.device("cpu"))
         h_flat_eval = h_eval[0][-1, 0]
         ctrl_in_eval = torch.cat([z_eval, h_flat_eval], dim=0).detach().numpy()
         action = best_policy.act(ctrl_in_eval)

@@ -198,21 +198,21 @@ def main(args: Optional[Sequence[str]] = None):
     # basic hyper‑params
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--layers", type=int, default=1)
-    p.add_argument("--epochs", type=int, default=0)
+    p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--bs", type=int, default=512)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--workers", type=int, default=16)
     # VAE integration params
-    p.add_argument("--vae-path", type=str, default="../../../trained_model/vae_latest.pt",
+    p.add_argument("--vae-path", type=str, default="../../../trained_bipedal_model/vae_latest.pt",
                    help="Path to trained VAE model")
-    p.add_argument("--data-path", type=str, default="../../../data/carracing",
+    p.add_argument("--data-path", type=str, default="../../../data/bipedal",
                    help="Path to image data directory")
     p.add_argument("--sequence-length", type=int, default=100,
                    help="Length of sequences for RNN training")
-    p.add_argument("--model-save-path", type=str, default="../../../trained_model/rnn_model.pt",
+    p.add_argument("--model-save-path", type=str, default="../../../trained_bipedal_model/rnn_model.pt",
                    help="Path to save the trained model")
-    p.add_argument("--load-model", type=str, default="../../../trained_model/rnn_model.pt",
+    p.add_argument("--load-model", type=str, default="", # "../../../trained_bipedal_model/rnn_model.pt"
                    help="Path to a previously-trained RNN checkpoint (.pt). "
                         "If given, the model will be loaded instead of "
                         "initialised from scratch.")
