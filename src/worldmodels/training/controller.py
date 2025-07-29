@@ -45,13 +45,13 @@ def run() -> None:
                         help="Path to trained RNN (.pt)")
     parser.add_argument("--popsize", type=int, default=16, help="CMA population λ")
     parser.add_argument("--sigma0", type=float, default=0.1, help="Initial CMA σ₀")
-    parser.add_argument("--rollouts", type=int, default=4, help="Episodes per evaluation")
-    parser.add_argument("--maxiter", type=int, default=50, help="Max CMA generations")
+    parser.add_argument("--rollouts", type=int, default=8, help="Episodes per evaluation")
+    parser.add_argument("--maxiter", type=int, default=100, help="Max CMA generations")
     parser.add_argument("--workers", type=int, default=8, help="# CPU workers")
     parser.add_argument("--render", action="store_true", default=False, help="Render a final greedy run")
     parser.add_argument("--save-model", default="../../../trained_bipedal_model/controller_best.pt",
                         help="Path to save best controller (.pt)")
-    parser.add_argument("--load-model", default="",  # "../../../trained_bipedal_model/controller_best_891.pt"
+    parser.add_argument("--load-model", default="../../../trained_bipedal_model/controller_best.pt",  # "../../../trained_bipedal_model/controller_best_891.pt"
                         help="Path to an existing controller to resume / evaluate")
 
     args = parser.parse_args()

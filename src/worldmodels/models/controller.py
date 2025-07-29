@@ -72,6 +72,7 @@ def _obs_to_frame(env, obs: np.ndarray) -> np.ndarray:
 @dataclass
 class ControllerCfg:
     input_size: int
+    action_bounds: list[tuple[float, float]]
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -219,7 +220,8 @@ class PolicyNet(nn.Module):
         """Save weights and config as a pure-dict checkpoint (pickle-safe)."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
         cfg = ControllerCfg(
-            input_size=self.fc.in_features
+            input_size=self.fc.in_features,
+            action_bounds=[(float(l), float(h)) for (l, h) in self.action_bounds],
         )
         torch.save(
             {
