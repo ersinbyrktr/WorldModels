@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from gymnasium import Env
 
-from src.worldmodels.envs.carracing import make_env
+import src.worldmodels.envs.carracing as CarracingEnv
 from src.worldmodels.models.controller import (
     PolicyNet,
     _params_to_vector,
@@ -73,7 +73,7 @@ def run() -> None:
         print(f"[init] Loading controller from {args.load_model}")
         seed_policy = PolicyNet.load_model(args.load_model, device="cpu")
     else:
-        seed_policy = PolicyNet(input_size=CTRL_IN_DIM)
+        seed_policy = PolicyNet(input_size=CTRL_IN_DIM, action_bounds=CarracingEnv.action_space)
     x0 = _params_to_vector(seed_policy)
 
     cma_opts: dict[str, int] = {}
@@ -130,7 +130,7 @@ def run() -> None:
 
     # ------------------------------------------------------------------ determine the best policy ---
     print(f"\n[save] Writing best controller to {args.save_model}")
-    best_policy = PolicyNet(input_size=CTRL_IN_DIM)
+    best_policy = PolicyNet(input_size=CTRL_IN_DIM, action_bounds=CarracingEnv.action_space)
     _vector_to_params(best_policy, best_vec_global)
 
     if args.maxiter > 0:
@@ -142,7 +142,7 @@ def run() -> None:
     #  Retrieve & test best controller
     # ────────────────────────────────────────────────────────────────────────────────
 
-    env_test: Env = make_env(render_mode="human" if args.render else None)()
+    env_test: Env = CarracingEnv.make_env(render_mode="human" if args.render else None)()
     obs, _ = env_test.reset()
     vae_eval, rnn_eval = _load_models(args.vae_path, args.rnn_path, torch.device("cpu"))
     h_eval = (

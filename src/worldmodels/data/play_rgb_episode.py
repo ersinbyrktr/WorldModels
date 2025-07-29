@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# play_carracing_episode.py
+# play_rgb_episode.py
 from __future__ import annotations
 
 import argparse
@@ -11,12 +11,12 @@ import numpy as np
 
 def play_episode(npy_path: str | Path, fps: int = 50) -> None:
     """
-    Visualise a saved CarRacing episode stored as a .npy file.
+    Visualise a saved RGB episode stored as a .npy file.
 
     Parameters
     ----------
     npy_path : str | Path
-        Path to the .npy file produced by collect_carracing_episodes.py
+        Path to the .npy file which contains the rgb frames.
         (shape == (N, H, W, 3), dtype=uint8, RGB).
     fps : int, default 50
         Playback speed in frames‑per‑second. 50 matches the game's metadata.
@@ -45,9 +45,9 @@ def play_episode(npy_path: str | Path, fps: int = 50) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Play a recorded CarRacing episode (.npy)")
+        description="Play a recorded episode (.npy)")
     parser.add_argument("--npy", type=str, help="Path to episode_XXXXX.npy",
-                        default="../../../data/carracing/episode_00000.npy")
+                        default="../../../data/bipedal/episode_00000_obs.npy")
     parser.add_argument("--fps", type=int, default=50,
                         help="Playback FPS (default: 50)")
     args = parser.parse_args()

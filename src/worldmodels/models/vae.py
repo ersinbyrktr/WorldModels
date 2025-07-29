@@ -172,15 +172,15 @@ def main():
     ap.add_argument("--loss", choices=["L2", "BCE"], default="L2")
     ap.add_argument("--latent", type=int, default=32)
     ap.add_argument("--warm", type=int, default=1)
-    ap.add_argument("--outdir", type=str, default="world_models_elbo_outputs")
-    ap.add_argument("--model-path", type=str, default="../../../trained_model",
+    ap.add_argument("--outdir", type=str, default="world_models_bipedal_vae")
+    ap.add_argument("--model-path", type=str, default="../../../trained_bipedal_model",
                     help="Path to save/load model checkpoints")
-    ap.add_argument("--load-model", type=str, default="",
+    ap.add_argument("--load-model", type=str, default="", # "../../../trained_bipedal_model/vae_latest.pt"
                     help="Path to load a pretrained model")
     args = ap.parse_args()
     torch.backends.cudnn.benchmark = True
     train_loader, test_loader = make_vae_dataloaders(
-        "../../../data/carracing",
+        "../../../data/bipedal",
         batch_size=args.batch,
         num_workers=min(16, os.cpu_count())
     )

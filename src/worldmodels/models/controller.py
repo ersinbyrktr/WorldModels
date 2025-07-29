@@ -65,29 +65,58 @@ class PolicyNet(nn.Module):
         (z_t, h_t)  →  (steer, gas, brake)
     """
 
-    def __init__(self, input_size: int, hidden_size: int = 64):
+    def __init__(self, input_size: int, action_bounds: list[tuple[float, float]]):
+        """
+        Parameters
+        ----------
+        input_size : int
+            Size of the concatenated [z_t , h_t] vector.
+        env : gymnasium.Env
+            A single (not vector‑wrapped) environment instance.
+        """
         super().__init__()
-        self.fc = nn.Linear(input_size, 3)
+
+        self.action_bounds = action_bounds
+        act_dim = len(self.action_bounds)
+
+        # simple 1‑layer MLP head — replace with your own architecture if needed
+        self.fc = nn.Linear(input_size, act_dim)
+
+        # build masks once, keep them on whatever device the model lives on
+        tanh_mask = [low == -1 and high == 1 for low, high in self.action_bounds]
+        sigmoid_mask = [low == 0 and high == 1 for low, high in self.action_bounds]
+
+        # register as buffers so they follow `.to(device)` / `.cuda()` calls
+        self.register_buffer("_tanh_mask", torch.tensor(tanh_mask, dtype=torch.bool))
+        self.register_buffer("_sigmoid_mask", torch.tensor(sigmoid_mask, dtype=torch.bool))
+
+        if not (self._tanh_mask.any() or self._sigmoid_mask.any()):
+            raise ValueError("No dimensions matched (-1,1) or (0,1) bounds.")
 
     # ------------------------------------------------------------------ #
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x : (B, input_size) – concatenated [z_t , h_t]
+        Parameters
+        ----------
+        x : torch.Tensor, shape (B, input_size)
+            Concatenated features [z_t , h_t].
 
         Returns
         -------
-        actions : (B, 3)  with correct squashing:
-            steer  ∈ (-1,1)   via tanh
-            gas    ∈ (0,1)    via sigmoid
-            brake  ∈ (0,1)    via sigmoid
+        actions : torch.Tensor, shape (B, action_dim)
+            Each dimension is squashed to its correct range:
+            • (-1, 1) → tanh
+            • ( 0, 1) → sigmoid
         """
-        raw = self.fc(x)
+        raw = self.fc(x)  # (B, action_dim)
+        actions = torch.empty_like(raw)
 
-        steer = torch.tanh(raw[:, 0:1])
-        gas = torch.sigmoid(raw[:, 1:2])
-        brake = torch.sigmoid(raw[:, 2:3])
+        if self._tanh_mask.any():
+            actions[:, self._tanh_mask] = torch.tanh(raw[:, self._tanh_mask])
+        if self._sigmoid_mask.any():
+            actions[:, self._sigmoid_mask] = torch.sigmoid(raw[:, self._sigmoid_mask])
 
-        return torch.cat([steer, gas, brake], dim=1)
+        return actions
 
     # ------------------------------------------------------------------ #
     def act(self, controller_input: np.ndarray) -> np.ndarray:
