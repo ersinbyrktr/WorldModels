@@ -47,7 +47,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Play a recorded episode (.npy)")
     parser.add_argument("--npy", type=str, help="Path to episode_XXXXX.npy",
-                        default="../../../data/bipedal/episode_00000_obs.npy")
+                        default="../../../data/bipedal/episode_00001_obs.npy")
     parser.add_argument("--fps", type=int, default=50,
                         help="Playback FPS (default: 50)")
     args = parser.parse_args()

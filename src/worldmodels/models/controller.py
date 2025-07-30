@@ -200,7 +200,6 @@ class PolicyNet(nn.Module):
                 h_flat = h[0][-1, 0]
                 ctrl_in = torch.cat([z_t, h_flat], dim=0).detach().cpu().numpy()
                 a = policy.act(ctrl_in)
-
                 # (3) env step
                 obs, reward, term, trunc, _ = env.step(a)
                 done = term or trunc
@@ -235,12 +234,41 @@ class PolicyNet(nn.Module):
     def load_model(cls, path: str | os.PathLike, device: str | torch.device = "cpu"):
         """
         Load a controller checkpoint saved by `save_model`.
-        Works even under PyTorch safe-unpickling (weights_only=True).
+        Backward-compatible with older checkpoints that lack `action_bounds`.
         """
         ckpt = torch.load(path, map_location=device, weights_only=True)
-        cfg_dict = ckpt["config"]
+        state_dict = ckpt["model_state_dict"]
+        cfg_dict = dict(ckpt.get("config", {}))  # copy to mutate safely
+
+        # Infer action_dim from the fc layer in the state_dict
+        try:
+            out_features = state_dict["fc.weight"].shape[0]
+        except KeyError as e:
+            raise KeyError("Checkpoint missing 'fc.weight' – cannot infer action_dim") from e
+
+        # If missing, infer reasonable action bounds from action_dim
+        if "action_bounds" not in cfg_dict:
+            if out_features == 3:
+                # CarRacing convention
+                cfg_dict["action_bounds"] = [(-1.0, 1.0), (0.0, 1.0), (0.0, 1.0)]
+            elif out_features == 4:
+                # BipedalWalker convention
+                cfg_dict["action_bounds"] = [(-1.0, 1.0)] * 4
+            else:
+                raise ValueError(
+                    "Cannot infer action_bounds: unexpected action_dim "
+                    f"{out_features}. Please resave the model with action_bounds "
+                    "or pass a loader that supplies them explicitly."
+                )
+
+        # If missing, also fill input_size from the layer in state_dict
+        if "input_size" not in cfg_dict:
+            in_features = state_dict["fc.weight"].shape[1]
+            cfg_dict["input_size"] = int(in_features)
+
+        # Construct and load
         model = cls(**cfg_dict).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_state_dict(state_dict)
         return model
 
 

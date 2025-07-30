@@ -3,8 +3,8 @@ from pathlib import Path
 import torch
 from gymnasium import wrappers
 
-from src.worldmodels.envs.carracing import make_env
-from src.worldmodels.models.controller import PolicyNet, _load_models, _encode_frame
+from src.worldmodels.envs.bipedal_walker import make_env
+from src.worldmodels.models.controller import PolicyNet, _load_models, _encode_frame, _obs_to_frame
 
 
 def record_single_episode(
@@ -51,7 +51,8 @@ def record_single_episode(
     #    implicitly through the wrapper).                                   #
     # --------------------------------------------------------------------- #
     while not done:
-        z = _encode_frame(obs, vae, dev)  # (latent,)
+        frame = _obs_to_frame(env, obs)  # ← NEW
+        z = _encode_frame(frame, vae, dev)  # (latent,)
         ctrl_in = torch.cat([z, h[0][-1, 0]], dim=0)  # (latent+hidden,)
         action = policy.act(ctrl_in.cpu().detach().numpy())
 
@@ -68,7 +69,7 @@ def record_single_episode(
 
 
 if __name__ == "__main__":
-    vae_path = "../../../trained_model/vae_latest.pt"
-    rnn_path = "../../../trained_model/rnn_model.pt"
-    best_policy = PolicyNet.load_model("../../../trained_model/controller_best_891.pt")
+    vae_path = "../../../trained_bipedal_model/vae_latest.pt"
+    rnn_path = "../../../trained_bipedal_model/rnn_model.pt"
+    best_policy = PolicyNet.load_model("../../../trained_bipedal_model/controller_best.pt")
     record_single_episode(best_policy, vae_path, rnn_path)
