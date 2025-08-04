@@ -1,42 +1,270 @@
 """
-Controller for a World-Models agent.
-
-The policy receives the VAE latent vector **z_t** (dim = VAE.latent) and the
-top-layer LSTM hidden state **h_t** (dim = RNN.hidden_size).  It outputs a
-continuous three-dimensional action:
-
-    [steer  ∈ (-1,1),   gas ∈ (0,1),   brake ∈ (0,1)]
-
-The file also provides helpers to flatten / unflatten the parameter vector so
-that the controller can be optimised by CMA-ES.
+World-Models Controller (paths derived from EnvKind; VAE/RNN can be passed directly).
 """
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
-from dataclasses import dataclass, asdict
+import time
+from dataclasses import dataclass, replace
+from typing import List, Optional, Tuple
 
-import cv2
+import cma
 import numpy as np
 import torch
 import torch.nn as nn
+from gymnasium import Env
 
-import src.worldmodels.envs.bipedal_walker as BipedalWalkerEnv
+from src.worldmodels.envs import EnvKind  # enum with .adapter_cls and .short_name
 from src.worldmodels.models.rnn import MDN_LSTM
 from src.worldmodels.models.vae import VAE
+from src.worldmodels.utils.paths import get_controller_model_dir
+from src.worldmodels.utils.utils import _encode_frame, _obs_to_frame
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-#  Weight-vector helpers
+# Config (derive controller paths from EnvKind + controller `name`)
 # ────────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ControllerCfg:
+    # Provide VAE/RNN instances directly (recommended).
+    # main process (evaluation). Worker processes will *not* receive them.
+    vae: Optional[VAE]
+    rnn: Optional[MDN_LSTM]
+
+    # Checkpoint folders:
+    #   CTRL  → ../../../trained_{env}_model/{name}/controller_latest.pt
+    env: EnvKind = EnvKind.CARRACING
+    name: str = "ctrl_baseline"
+
+    # If you run CMA-ES with multiple processes, workers will lazily load models
+    # using the standard `load_latest` helpers (no need to pass paths).
+    vae_name: str = "vae_baseline"
+    rnn_name: str = "rnn_baseline"
+
+    # runtime
+    device: str = "cpu"
+    env_seed: Optional[int] = None
+
+    # CMA-ES
+    popsize: int = 16
+    sigma0: float = 0.1
+    rollouts: int = 8
+    maxiter: int = 25
+    workers: int = 16
+
+    action_bounds: Optional[List[Tuple[float, float]]] = None
+    input_size: Optional[int] = None
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Policy
+# ────────────────────────────────────────────────────────────────────────────────
+
+class PolicyNet(nn.Module):
+    def __init__(self, cfg: ControllerCfg):
+        super().__init__()
+        input_dim = _computed_input_size(cfg)  # ← new helper (below)
+        if cfg.action_bounds is None:
+            raise ValueError("cfg.action_bounds must be set.")
+        self.cfg = cfg
+        self.fc = nn.Linear(input_dim, len(cfg.action_bounds))
+        tanh_mask = [lo == -1 and hi == 1 for lo, hi in cfg.action_bounds]
+        sigmoid_mask = [lo == 0 and hi == 1 for lo, hi in cfg.action_bounds]
+        self.register_buffer("_tanh_mask", torch.tensor(tanh_mask, dtype=torch.bool))
+        self.register_buffer("_sigmoid_mask", torch.tensor(sigmoid_mask, dtype=torch.bool))
+        if not (self._tanh_mask.any() or self._sigmoid_mask.any()):
+            raise ValueError("No action dims matched (-1,1) or (0,1).")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = self.fc(x)
+        a = torch.empty_like(raw)
+        if self._tanh_mask.any():
+            a[:, self._tanh_mask] = torch.tanh(raw[:, self._tanh_mask])
+        if self._sigmoid_mask.any():
+            a[:, self._sigmoid_mask] = torch.sigmoid(raw[:, self._sigmoid_mask])
+        return a
+
+    def act(self, controller_input: np.ndarray) -> np.ndarray:
+        x = torch.from_numpy(controller_input).float().unsqueeze(0)
+        with torch.no_grad():
+            return self.forward(x).squeeze(0).cpu().numpy()
+
+    # ------------- rollout used by CMA-ES (returns negative reward) -------------
+    @classmethod
+    def rollout(cls, policy_params: np.ndarray, cfg: ControllerCfg) -> float:
+        # NOTE: This method runs in *worker processes*. We *do not* rely on
+        # cfg.vae/cfg.rnn here (they are not pickled across processes).
+        dev = torch.device(cfg.device)
+        vae, rnn = _load_models_for_worker(cfg, dev)
+        policy = cls(cfg)
+        _vector_to_params(policy, policy_params)
+        policy.eval()
+
+        rewards: list[float] = []
+        env_thunk = _env_thunk(cfg)
+        for _ in range(cfg.rollouts):
+            env = env_thunk()
+            if cfg.env_seed is not None:
+                env.reset(seed=cfg.env_seed)
+            rewards.append(_episode_return(env, policy, vae, rnn, dev))
+            env.close()
+        return -float(np.mean(rewards))
+
+    # ------------- persistence ---------------------------------------------------
+    def save_model(self, path: str) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(
+            {
+                "model_state_dict": self.state_dict(),
+                "config": {
+                    "input_size": int(self.fc.in_features),
+                    "action_bounds": [(float(l), float(h)) for (l, h) in self.cfg.action_bounds or []],
+                },
+            },
+            path,
+        )
+
+    @classmethod
+    def load_model(cls, path: str, device: str | torch.device = "cpu") -> "PolicyNet":
+        """
+        Strict loader: expects a checkpoint saved by `save_model` with:
+          {
+            "model_state_dict": ...,
+            "config": {"input_size": int, "action_bounds": List[Tuple[float, float]]}
+          }
+        """
+        ckpt = torch.load(path, map_location=device, weights_only=True)
+        state = ckpt["model_state_dict"]
+        cfg_dict = ckpt["config"]
+        cfg = ControllerCfg(
+            input_size=int(cfg_dict["input_size"]),
+            action_bounds=[(float(l), float(h)) for (l, h) in cfg_dict["action_bounds"]],
+        )
+        model = cls(cfg).to(device)
+        model.load_state_dict(state)
+        return model
+
+    @classmethod
+    def load_latest(cls, env: EnvKind, name: str, device: Optional[torch.device] = None) -> "PolicyNet":
+        """
+        Load the latest controller checkpoint for a given (env, name) run:
+            path = ../../../trained_{env_short}_model/{name}/controller_latest.pt
+        """
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        ckpt = get_controller_model_dir(env, name) / "controller_latest.pt"
+        if not ckpt.is_file():
+            raise FileNotFoundError(f"Controller checkpoint not found: {ckpt}")
+        return cls.load_model(str(ckpt), device=device)
+
+
+def _action_dim(cfg: ControllerCfg) -> int:
+    adapter = cfg.env.adapter_cls(render_mode="rgb_array", seed=cfg.env_seed)
+    return len(adapter.action_bounds())
+
+
+_HEADER_CACHE: dict[tuple[str, str], int] = {}  # env / run-names → input dim
+
+
+def _computed_input_size(cfg: ControllerCfg) -> int:
+    """
+    latent_dim + rnn.hidden_size  (loads headers lazily if objects absent)
+    """
+    if cfg.vae is not None and cfg.rnn is not None:
+        return cfg.vae.latent + cfg.rnn.hidden_size
+
+    key = (cfg.env.name, f"{cfg.vae_name}|{cfg.rnn_name}")
+    if key not in _HEADER_CACHE:
+        # lightweight: read only checkpoint headers on CPU
+        vae = VAE.load_latest(cfg.env, cfg.vae_name, device="cpu")
+        rnn = MDN_LSTM.load_latest(cfg.env, cfg.rnn_name, device="cpu")
+        _HEADER_CACHE[key] = vae.latent + rnn.hidden_size
+        del vae, rnn
+    return _HEADER_CACHE[key]
+
+
+def _validate_models(cfg: ControllerCfg, vae: VAE, rnn: MDN_LSTM) -> None:
+    act_dim = _action_dim(cfg)
+    exp_in = vae.latent + act_dim
+    # rnn.cfg.<...> comes from the saved ModelCfg
+    got_in = getattr(rnn.cfg, "input_size", None)
+    got_out = getattr(rnn.cfg, "output_size", None)
+
+    if got_out is not None and got_out != vae.latent:
+        raise RuntimeError(
+            "VAE/RNN latent mismatch:\n"
+            f"  VAE.latent         = {vae.latent}\n"
+            f"  RNN.cfg.output_size= {got_out}\n"
+            "The RNN must be trained with the same VAE latent size."
+        )
+    if got_in is not None and got_in != exp_in:
+        raise RuntimeError(
+            "RNN input-size mismatch:\n"
+            f"  expected (vae.latent + action_dim) = {vae.latent} + {act_dim} = {exp_in}\n"
+            f"  RNN.cfg.input_size                 = {got_in}\n"
+            "This usually means the RNN was trained for a different env or VAE run.\n"
+            f"Check env={cfg.env.name}, vae_name={cfg.vae_name}, rnn_name={cfg.rnn_name}."
+        )
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Per-process model cache for workers
+# ────────────────────────────────────────────────────────────────────────────────
+
+_WORKER_CACHE: dict[tuple[str, str, str], tuple[VAE, MDN_LSTM]] = {}
+
+
+def _load_models_for_worker(cfg: ControllerCfg, device: torch.device) -> tuple[VAE, MDN_LSTM]:
+    key = (cfg.env.name, cfg.vae_name, cfg.rnn_name + f"@{device.type}")
+    if key not in _WORKER_CACHE:
+        vae = VAE.load_latest(cfg.env, cfg.vae_name, device=device).eval()
+        rnn = MDN_LSTM.load_latest(cfg.env, cfg.rnn_name, device=device).eval()
+        _validate_models(cfg, vae, rnn)  # ← add this
+        _WORKER_CACHE[key] = (vae, rnn)
+    return _WORKER_CACHE[key]
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Small helpers
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _env_thunk(cfg: ControllerCfg):
+    adapter = cfg.env.adapter_cls(render_mode="rgb_array", seed=cfg.env_seed)
+    return adapter.make_env()
+
+
+def _get_models_main(cfg: ControllerCfg, device: torch.device) -> tuple[VAE, MDN_LSTM]:
+    if cfg.vae is not None and cfg.rnn is not None:
+        vae = cfg.vae.to(device).eval()
+        rnn = cfg.rnn.to(device).eval()
+    else:
+        vae, rnn = _load_models_for_worker(cfg, device)
+    _validate_models(cfg, vae, rnn)  # ← add this
+    return vae, rnn
+
+
+def _fill_runtime(cfg: ControllerCfg) -> ControllerCfg:
+    # 1) Action bounds from adapter if missing (uses CollectorEnv.action_bounds()).
+    if cfg.action_bounds is None:
+        adapter = cfg.env.adapter_cls(render_mode="rgb_array", seed=cfg.env_seed)
+        cfg.action_bounds = [
+            (float(lo), float(hi)) for (lo, hi) in adapter.action_bounds()
+        ]
+    return cfg
+
+
+def _cfg_for_workers(cfg: ControllerCfg) -> ControllerCfg:
+    """Create a light copy of cfg to send to worker processes (drop model refs)."""
+    return replace(cfg, vae=None, rnn=None)
 
 
 def _params_to_vector(net: nn.Module) -> np.ndarray:
-    """Flatten all parameters into a single 1-D NumPy array."""
     return np.concatenate([p.detach().cpu().numpy().ravel() for p in net.parameters()])
 
 
 def _vector_to_params(net: nn.Module, vec: np.ndarray) -> None:
-    """Load a flat parameter vector back into a network *in-place*."""
     idx = 0
     for p in net.parameters():
         numel = p.numel()
@@ -45,307 +273,139 @@ def _vector_to_params(net: nn.Module, vec: np.ndarray) -> None:
         idx += numel
 
 
-def _looks_like_image(arr: np.ndarray) -> bool:
-    if arr.ndim == 3 and (arr.shape[-1] in (1, 3, 4) or arr.shape[0] in (1, 3, 4)):
-        return True
-    if arr.ndim == 2:
-        return True
-    return False
+def _vector_to_policy(vec: np.ndarray, cfg: ControllerCfg) -> PolicyNet:
+    p = PolicyNet(cfg)
+    _vector_to_params(p, vec)
+    return p
 
 
-def _obs_to_frame(env, obs: np.ndarray) -> np.ndarray:
-    """Return an HWC image frame for the current state."""
-    if isinstance(obs, np.ndarray) and _looks_like_image(obs):
-        return obs
-    # Otherwise, fall back to renderer (requires render_mode="rgb_array")
-    frame = env.render()
-    if frame is None:
-        raise RuntimeError(
-            "env.render() returned None. Create env with render_mode='rgb_array'."
-        )
-    return frame
-
-
-# ─────────────────────────────────────────────────────────────────────────
-#  Config dataclass  (avoids pickling issues)
-# ─────────────────────────────────────────────────────────────────────────
-@dataclass
-class ControllerCfg:
-    input_size: int
-    action_bounds: list[tuple[float, float]]
-
-
-# ────────────────────────────────────────────────────────────────────────────────
-#  Policy network
-# ────────────────────────────────────────────────────────────────────────────────
-
-
-class PolicyNet(nn.Module):
-    """
-    Minimal 2-layer MLP controller:
-
-        (z_t, h_t)  →  (steer, gas, brake)
-    """
-
-    def __init__(self, input_size: int, action_bounds: list[tuple[float, float]]):
-        """
-        Parameters
-        ----------
-        input_size : int
-            Size of the concatenated [z_t , h_t] vector.
-        env : gymnasium.Env
-            A single (not vector‑wrapped) environment instance.
-        """
-        super().__init__()
-
-        self.action_bounds = action_bounds
-        act_dim = len(self.action_bounds)
-
-        # simple 1‑layer MLP head — replace with your own architecture if needed
-        self.fc = nn.Linear(input_size, act_dim)
-
-        # build masks once, keep them on whatever device the model lives on
-        tanh_mask = [low == -1 and high == 1 for low, high in self.action_bounds]
-        sigmoid_mask = [low == 0 and high == 1 for low, high in self.action_bounds]
-
-        # register as buffers so they follow `.to(device)` / `.cuda()` calls
-        self.register_buffer("_tanh_mask", torch.tensor(tanh_mask, dtype=torch.bool))
-        self.register_buffer("_sigmoid_mask", torch.tensor(sigmoid_mask, dtype=torch.bool))
-
-        if not (self._tanh_mask.any() or self._sigmoid_mask.any()):
-            raise ValueError("No dimensions matched (-1,1) or (0,1) bounds.")
-
-    # ------------------------------------------------------------------ #
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : torch.Tensor, shape (B, input_size)
-            Concatenated features [z_t , h_t].
-
-        Returns
-        -------
-        actions : torch.Tensor, shape (B, action_dim)
-            Each dimension is squashed to its correct range:
-            • (-1, 1) → tanh
-            • ( 0, 1) → sigmoid
-        """
-        raw = self.fc(x)  # (B, action_dim)
-        actions = torch.empty_like(raw)
-
-        if self._tanh_mask.any():
-            actions[:, self._tanh_mask] = torch.tanh(raw[:, self._tanh_mask])
-        if self._sigmoid_mask.any():
-            actions[:, self._sigmoid_mask] = torch.sigmoid(raw[:, self._sigmoid_mask])
-
-        return actions
-
-    # ------------------------------------------------------------------ #
-    def act(self, controller_input: np.ndarray) -> np.ndarray:
-        """Greedy action for a *single* concatenated input (1-D NumPy)."""
-        x = torch.from_numpy(controller_input).float().unsqueeze(0)  # (1,D)
+def _episode_return(env: Env, policy: PolicyNet, vae: VAE, rnn: MDN_LSTM, dev: torch.device) -> float:
+    obs, _ = env.reset()
+    h = (
+        torch.zeros(rnn.cfg.num_layers, 1, rnn.hidden_size, device=dev),
+        torch.zeros(rnn.cfg.num_layers, 1, rnn.hidden_size, device=dev),
+    )
+    done, ret = False, 0.0
+    while not done:
+        frame = _obs_to_frame(env, obs)
         with torch.no_grad():
-            a = self.forward(x).squeeze(0).cpu().numpy()
-        return a
+            z_t = _encode_frame(frame, vae, dev)
+        h_flat = h[0][-1, 0]
+        ctrl_in = torch.cat([z_t, h_flat], dim=0).detach().cpu().numpy()
+        a = policy.act(ctrl_in)
+        obs, r, term, trunc, _ = env.step(a)
+        done = term or trunc
+        ret += r
+        za_t = torch.cat([z_t, torch.from_numpy(a).to(dev)], dim=0).unsqueeze(0)
+        _, _, _, h = rnn(za_t, h)
+    return float(ret)
 
-    # ------------------------------------------------------------------ #
-    #  CMA-ES rollout
-    # ------------------------------------------------------------------ #
-    @classmethod
-    def rollout(
-            cls,
-            policy_params: np.ndarray,
-            rollouts_per_eval: int,
-            vae_path: str,
-            rnn_path: str,
-            device: str = "cpu",
-            env_seed: int | None = None,
-    ) -> float:
-        """
-        Evaluate one controller
 
-        Returns **negative** average reward so that CMA-ES (which minimises)
-        can be used directly.
-        """
-        dev = torch.device(device)
-        vae, rnn = _load_models(vae_path, rnn_path, dev)
-        latent_dim = vae.latent
-        hidden_dim = rnn.hidden_size
+def _evaluate_greedy(policy: PolicyNet, cfg: ControllerCfg) -> float:
+    dev = torch.device(cfg.device)
+    vae, rnn = _get_models_main(cfg, dev)
+    env = _env_thunk(cfg)()
+    try:
+        total = _episode_return(env, policy, vae, rnn, dev)
+    finally:
+        env.close()
+    return total
 
-        policy = cls(input_size=latent_dim + hidden_dim, action_bounds=BipedalWalkerEnv.action_space)
-        _vector_to_params(policy, policy_params)
-        policy.eval()
 
-        rewards: list[float] = []
-        for _ in range(rollouts_per_eval):
-            # OPTIONAL but clearer: ensure render_mode returns RGB arrays
-            env = BipedalWalkerEnv.make_env(render_mode="rgb_array")()  # ← change (optional)
-            if env_seed is not None:
-                env.reset(seed=env_seed)
+def _cma_optimize(x0: np.ndarray, cfg: ControllerCfg) -> Tuple[np.ndarray, float]:
+    es = cma.CMAEvolutionStrategy(x0, cfg.sigma0, {"popsize": int(cfg.popsize)})
+    best_reward, best_vec = -float("inf"), x0.copy()
+    t0 = time.time()
 
-            obs, _ = env.reset()
-            h = (
-                torch.zeros(rnn.cfg.num_layers, 1, hidden_dim, device=dev),
-                torch.zeros(rnn.cfg.num_layers, 1, hidden_dim, device=dev),
+    # Send a light cfg (no model objects) to workers
+    worker_cfg = _cfg_for_workers(cfg)
+    mp_context = mp.get_context("spawn")
+    with mp_context.Pool(processes=cfg.workers) as pool:
+        print(f"[CMA-ES] Using {cfg.workers} worker processes")
+        for gen in range(cfg.maxiter):
+            offspring = es.ask()
+            fitnesses = pool.starmap(PolicyNet.rollout, [(np.asarray(v, np.float32), worker_cfg) for v in offspring])
+            es.tell(offspring, fitnesses)
+            if gen % 10 == 0:
+                es.disp()
+
+            rewards = [-f for f in fitnesses]
+            gen_best = float(np.max(rewards))
+            if gen_best > best_reward:
+                best_reward = gen_best
+                best_vec = offspring[int(np.argmax(rewards))]
+            gen_mean = float(np.mean(rewards))
+            elapsed = (time.time() - t0) / 60
+            print(
+                f"[Gen {gen:04d}/{cfg.maxiter}] best {gen_best:7.1f} | mean {gen_mean:7.1f} | "
+                f"global {best_reward:7.1f} | {elapsed:5.1f} min",
+                flush=True,
             )
-
-            ep_reward, done = 0.0, False
-            while not done:
-                # (1) frame → latent z_t
-                frame = _obs_to_frame(env, obs)  # ← NEW
-                with torch.no_grad():
-                    z_t = _encode_frame(frame, vae, dev)  # ← replace obs → frame
-
-                # (2) controller input & action
-                h_flat = h[0][-1, 0]
-                ctrl_in = torch.cat([z_t, h_flat], dim=0).detach().cpu().numpy()
-                a = policy.act(ctrl_in)
-                # (3) env step
-                obs, reward, term, trunc, _ = env.step(a)
-                done = term or trunc
-                ep_reward += reward
-
-                # (4) update RNN hidden
-                za_t = torch.cat([z_t, torch.from_numpy(a).to(dev)], dim=0).unsqueeze(0)
-                _, _, _, h = rnn(za_t, h)
-
-            env.close()
-            rewards.append(ep_reward)
-
-        # CMA-ES minimises the objective
-        return -float(np.mean(rewards))
-
-    def save_model(self, path: str | os.PathLike) -> None:
-        """Save weights and config as a pure-dict checkpoint (pickle-safe)."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        cfg = ControllerCfg(
-            input_size=self.fc.in_features,
-            action_bounds=[(float(l), float(h)) for (l, h) in self.action_bounds],
-        )
-        torch.save(
-            {
-                "model_state_dict": self.state_dict(),
-                "config": asdict(cfg),
-            },
-            path,
-        )
-
-    @classmethod
-    def load_model(cls, path: str | os.PathLike, device: str | torch.device = "cpu"):
-        """
-        Load a controller checkpoint saved by `save_model`.
-        Backward-compatible with older checkpoints that lack `action_bounds`.
-        """
-        ckpt = torch.load(path, map_location=device, weights_only=True)
-        state_dict = ckpt["model_state_dict"]
-        cfg_dict = dict(ckpt.get("config", {}))  # copy to mutate safely
-
-        # Infer action_dim from the fc layer in the state_dict
-        try:
-            out_features = state_dict["fc.weight"].shape[0]
-        except KeyError as e:
-            raise KeyError("Checkpoint missing 'fc.weight' – cannot infer action_dim") from e
-
-        # If missing, infer reasonable action bounds from action_dim
-        if "action_bounds" not in cfg_dict:
-            if out_features == 3:
-                # CarRacing convention
-                cfg_dict["action_bounds"] = [(-1.0, 1.0), (0.0, 1.0), (0.0, 1.0)]
-            elif out_features == 4:
-                # BipedalWalker convention
-                cfg_dict["action_bounds"] = [(-1.0, 1.0)] * 4
-            else:
-                raise ValueError(
-                    "Cannot infer action_bounds: unexpected action_dim "
-                    f"{out_features}. Please resave the model with action_bounds "
-                    "or pass a loader that supplies them explicitly."
-                )
-
-        # If missing, also fill input_size from the layer in state_dict
-        if "input_size" not in cfg_dict:
-            in_features = state_dict["fc.weight"].shape[1]
-            cfg_dict["input_size"] = int(in_features)
-
-        # Construct and load
-        model = cls(**cfg_dict).to(device)
-        model.load_state_dict(state_dict)
-        return model
+            if es.stop():
+                print("[CMA-ES] Stopping criteria met.")
+                break
+    return best_vec, best_reward
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-#  Per-process model cache & helpers
+# Orchestration
 # ────────────────────────────────────────────────────────────────────────────────
 
-_CACHED_MODELS: dict[tuple[str, str, str], tuple[VAE, MDN_LSTM]] = {}
+def run(cfg: Optional[ControllerCfg] = None) -> None:
+    cfg = _fill_runtime(cfg or ControllerCfg())
 
+    # If a previous controller exists, start from it
+    ctrl_dir = get_controller_model_dir(cfg.env, cfg.name)
+    ctrl_ckpt = ctrl_dir / "controller_latest.pt"
+    ctrl_dir.mkdir(parents=True, exist_ok=True)
 
-def _load_models(vae_path: str, rnn_path: str, device: torch.device):
-    """
-    Load (or retrieve cached) VAE & RNN on the requested device.
-    """
-    key = (vae_path, rnn_path, device.type)
-    if key not in _CACHED_MODELS:
-        vae = VAE.load_model(vae_path, device)
-        rnn = MDN_LSTM.load_model(rnn_path, device)
-        vae.eval()
-        rnn.eval()
-        _CACHED_MODELS[key] = (vae, rnn)
-    return _CACHED_MODELS[key]
-
-
-def _encode_frame(img: np.ndarray, vae, device: torch.device) -> torch.Tensor:
-    """
-    Accepts a frame in common layouts and returns z_t (latent from VAE).
-
-    Accepts:
-      - HWC RGB/RGBA  (H, W, 3/4)
-      - CHW RGB/RGBA  (3/4, H, W)
-      - Grayscale     (H, W)       -> replicated to 3 channels
-
-    Resizes to 64x64 (if your VAE was trained on 64x64) and converts to [0,1] float.
-    """
-
-    img = np.asarray(img)
-
-    # ---- Normalize layout to HWC, 3 channels
-    if img.ndim == 2:
-        # grayscale HxW -> HxWx3
-        img = np.repeat(img[..., None], 3, axis=-1)
-    elif img.ndim == 3:
-        # CHW -> HWC
-        if img.shape[0] in (1, 3, 4) and img.shape[-1] not in (3, 4):
-            img = np.moveaxis(img, 0, -1)
-        # RGBA -> RGB
-        if img.shape[-1] == 4:
-            img = img[..., :3]
-        elif img.shape[-1] == 1:
-            img = np.repeat(img, 3, axis=-1)
+    if ctrl_ckpt.is_file():
+        print(f"[init] Loading controller seed from {ctrl_ckpt}")
+        seed_policy = PolicyNet.load_model(str(ctrl_ckpt), device="cpu")
+        seed_policy.cfg = cfg
     else:
-        raise ValueError(f"_encode_frame: unsupported input shape {img.shape}")
+        seed_policy = PolicyNet(cfg)
 
-    # ---- Ensure uint8 HWC 64x64x3
-    if img.dtype != np.uint8:
-        # If 0..1 floats, scale to 0..255; otherwise clip
-        vmin, vmax = float(np.min(img)), float(np.max(img))
-        if 0.0 <= vmin and vmax <= 1.0:
-            img = (img * 255.0).clip(0, 255).astype(np.uint8)
-        else:
-            img = np.clip(img, 0, 255).astype(np.uint8)
+    x0 = _params_to_vector(seed_policy)
+    best_vec, best_reward = _cma_optimize(x0, cfg)
 
-    if img.shape[:2] != (64, 64):
-        img = cv2.resize(img, (64, 64), interpolation=cv2.INTER_LINEAR)
+    print(f"\n[save] Writing best controller to {ctrl_ckpt}")
+    best_policy = _vector_to_policy(best_vec, cfg)
+    if cfg.maxiter > 0:
+        print(f"\n[CMA-ES] Best avg reward over {cfg.rollouts} rollouts: {best_reward:.1f}")
+        best_policy.save_model(str(ctrl_ckpt))
 
-    x = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
-    with torch.no_grad():
-        z_mu, _ = vae.encode(x)  # adjust if your VAE API differs
-    return z_mu.squeeze(0)
+    tot = _evaluate_greedy(best_policy, cfg)
+    print(f"[CMA-ES] Greedy reward in single episode: {tot:.1f}")
 
 
-# Expose helpers for the training script
-__all__ = [
-    "PolicyNet",
-    "_params_to_vector",
-    "_vector_to_params",
-    "_load_models",
-    "_encode_frame",
-]
+if __name__ == "__main__":
+    # Load VAE/RNN *first* and pass them directly into the controller config.
+    from src.worldmodels.models.vae import VAE
+    from src.worldmodels.models.rnn import MDN_LSTM
+
+    mp.set_start_method("spawn", force=True)
+
+    env = EnvKind.CARRACING
+    vae_name = "vae_small"
+    rnn_name = "rnn_small"
+    ctrl_name = "ctrl_small"
+
+    vae = VAE.load_latest(env=env, name=vae_name)  # ../../../trained_{env}_model/{vae_name}/vae_latest.pt
+    rnn = MDN_LSTM.load_latest(env=env, name=rnn_name)  # ../../../trained_{env}_model/{rnn_name}/rnn_latest.pt
+
+    cfg = ControllerCfg(
+        env=env,
+        name=ctrl_name,
+        vae=vae,  # used in main process
+        rnn=rnn,  # used in main process
+        vae_name=vae_name,  # used by worker processes to lazy-load
+        rnn_name=rnn_name,  # used by worker processes to lazy-load
+        device="cpu",
+        maxiter=25,
+        popsize=16,
+        sigma0=0.1,
+        rollouts=8,
+        workers=16,
+    )
+    run(cfg)

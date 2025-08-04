@@ -1,28 +1,43 @@
+#!/usr/bin/env python
+# scripts/play_env_keyboard.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
 import numpy as np
-from gymnasium.envs.box2d import car_racing  # pulls in the module, *not* an env
 from gymnasium.utils.play import play
 
-from src.worldmodels.envs.carracing import make_env
+from src.worldmodels.envs import EnvKind  # your Enum with .adapter_cls
 
-car_racing.TRACK_TURN_RATE = 0.03  # default 0.31  → curlier
 
-env = make_env()()
+@dataclass
+class KeyboardPlayCfg:
+    env: EnvKind = EnvKind.CARRACING  # or EnvKind.BIPEDAL_WALKER
+    render_mode: str = "rgb_array"  # required by gym.utils.play
+    fps: int = 60
+    zoom: float = 1.0
+    seed: Optional[int] = None
 
-keys_to_action = {
-    # single-key presses
-    "w": np.array([0.0, 1.0, 0.0], dtype=np.float32),  # accelerate
-    "s": np.array([0.0, 0.0, 0.8], dtype=np.float32),  # brake
-    "a": np.array([-1.0, 0.0, 0.0], dtype=np.float32),  # steer left
-    "d": np.array([1.0, 0.0, 0.0], dtype=np.float32),  # steer right
-    # combined presses (e.g. hold W + A or W + D to corner under throttle)
-    ("w", "a"): np.array([-1.0, 1.0, 0.0], dtype=np.float32),
-    ("w", "d"): np.array([1.0, 1.0, 0.0], dtype=np.float32),
-}
 
-play(
-    env,
-    keys_to_action=keys_to_action,
-    fps=60,
-    zoom=1.0,  # ⇧ for pixel-perfect; >1.0 zooms in
-    noop=np.array([0.0, 0.0, 0.0], dtype=np.float32),  # when no key is pressed
-)
+def run(cfg: KeyboardPlayCfg) -> None:
+    adapter = cfg.env.adapter_cls(render_mode=cfg.render_mode, seed=cfg.seed)
+    env = adapter.make_env()()
+
+    try:
+        keymap = adapter.keys_to_action()
+        noop = adapter.noop_action(env.action_space).astype(np.float32)
+
+        play(
+            env,
+            keys_to_action=keymap,
+            fps=cfg.fps,
+            zoom=cfg.zoom,
+            noop=noop,
+        )
+    finally:
+        env.close()
+
+
+if __name__ == "__main__":
+    run(KeyboardPlayCfg(env=EnvKind.BIPEDAL_WALKER, fps=60, zoom=1.0))
