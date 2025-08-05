@@ -37,7 +37,7 @@ class RNNRunCfg:
     vae: "VAE" | None = None
 
     # Model
-    hidden: int = 512
+    hidden: int = 256
     layers: int = 1
 
     # Train
@@ -45,7 +45,7 @@ class RNNRunCfg:
     lr: float = 1e-4
     step_size: int = 4
     gamma: float = 0.5
-    bs: int = 512  # kept for compatibility; dataset builder controls batching
+    batch_size: int = 8  # kept for compatibility; dataset builder controls batching
 
     # System
     seed: int = 1
@@ -296,7 +296,7 @@ def _build_dataloaders(cfg: RNNRunCfg, device: torch.device):
         vae=cfg.vae,
         data_root=str(data_root),
         action_dim_expected=action_dim_expected,  # ← NEW
-        batch_size=cfg.bs,
+        batch_size=cfg.batch_size,
         num_workers=cfg.workers,
         device=device,
     )
@@ -438,16 +438,19 @@ if __name__ == "__main__":
     # Example usage: load VAE externally and pass it in.
     from src.worldmodels.models.vae import VAE
 
-    env = EnvKind.CARRACING
-    vae_name = "vae_small"
+    env = EnvKind.PENDULUM
+    vae_name = "baseline"
 
     vae = VAE.load_latest(env=env, name=vae_name)  # loads ../../../trained_{env}_model/{vae_name}/vae_latest.pt
 
     cfg = RNNRunCfg(
         env=env,
         collection_name="baseline",
-        name="rnn_small",  # separate RNN run folder
+        name="baseline",  # separate RNN run folder
         vae=vae,
-        epochs=20,
+        epochs=5,
+        hidden=512,
+        step_size=5,
+        lr=1e-6,
     )
     run(cfg)

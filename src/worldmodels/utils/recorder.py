@@ -27,7 +27,7 @@ class RecorderCfg:
     env: EnvKind
     vae_name: str
     rnn_name: str
-    name: str  # controller run name
+    controller_name: str
     device: str = "cpu"
     render_mode: str = "rgb_array"
     seed: Optional[int] = None
@@ -45,9 +45,9 @@ def _video_paths(cfg: RecorderCfg) -> Tuple[Path, str]:
     """
     Returns (video_dir, file_prefix)
     """
-    ctrl_dir = get_controller_model_dir(cfg.env, cfg.name)
+    ctrl_dir = get_controller_model_dir(cfg.env, cfg.controller_name)
     video_dir = cfg.out_dir if cfg.out_dir is not None else (ctrl_dir / "videos")
-    prefix = cfg.name_prefix if cfg.name_prefix is not None else f"{cfg.name}_play"
+    prefix = cfg.name_prefix if cfg.name_prefix is not None else f"{cfg.controller_name}_play"
     return video_dir, prefix
 
 
@@ -74,10 +74,10 @@ def record_single_episode(cfg: RecorderCfg) -> None:
     dev = torch.device(cfg.device)
     vae = VAE.load_latest(cfg.env, cfg.vae_name, device=dev)
     rnn = MDN_LSTM.load_latest(cfg.env, cfg.rnn_name, device=dev)
-    policy = PolicyNet.load_latest(cfg.env, cfg.name, device=dev)
+    policy = PolicyNet.load_latest(cfg.env, cfg.controller_name, device=dev)
 
-    vae.eval();
-    rnn.eval();
+    vae.eval()
+    rnn.eval()
     policy.eval()
 
     # rollout
@@ -114,10 +114,10 @@ def record_single_episode(cfg: RecorderCfg) -> None:
 
 if __name__ == "__main__":
     cfg = RecorderCfg(
-        env=EnvKind.BIPEDAL_WALKER,  # or EnvKind.CARRACING
-        vae_name="vae_small",
-        rnn_name="rnn_small",
-        name="ctrl_small",
+        env=EnvKind.CARRACING,  # or EnvKind.CARRACING
+        vae_name="baseline",
+        rnn_name="baseline",
+        controller_name="baseline",
         device="cpu",
     )
     record_single_episode(cfg)

@@ -45,7 +45,7 @@ class VaeRunCfg:
     beta: float = 1.0
     kl_on: bool = True
     warm: int = 1
-    batch_size: int = 512
+    batch_size: int = 8
     num_workers: int = field(default_factory=lambda: min(16, os.cpu_count() or 16))
 
     # system
@@ -205,12 +205,6 @@ class VAE(nn.Module):
             xr, _, _ = self(x)
             return torch.sigmoid(xr) if self.recon_loss == "BCE" else xr
 
-    def per_sample_terms(self, x: torch.Tensor, xr: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor) -> tuple[
-        torch.Tensor, torch.Tensor]:
-        rc = F.binary_cross_entropy_with_logits(xr, x, reduction="none").flatten(1).sum(dim=1)
-        kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).sum(dim=1)
-        return rc, kl
-
     def save_model(self, path: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(
@@ -291,9 +285,9 @@ def run(cfg: Optional[VaeRunCfg] = None) -> None:
 
 if __name__ == "__main__":
     cfg = VaeRunCfg(
-        env=EnvKind.CARRACING,  # or EnvKind.BIPEDAL_WALKER
+        env=EnvKind.PENDULUM,  # or EnvKind.BIPEDAL_WALKER
         collection_name="baseline",  # matches collector's name used for data
-        name="vae_small",  # run/model name
-        epochs=1,
+        name="baseline",  # run/model name
+        epochs=5,
     )
     run(cfg)

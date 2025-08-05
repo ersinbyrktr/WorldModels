@@ -79,10 +79,10 @@ def run(cfg: CollectCfg) -> None:
 
 if __name__ == "__main__":
     cfg = CollectCfg(
-        env=EnvKind.CARRACING,  # or EnvKind.BIPEDAL_WALKER
+        env=EnvKind.PENDULUM,  # or EnvKind.BIPEDAL_WALKER
         name="baseline",
-        episodes=100,
-        workers=12,
+        episodes=2000,
+        workers=16,
         render_mode="rgb_array",
         seed=None,
     )

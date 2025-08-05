@@ -49,7 +49,7 @@ class ControllerCfg:
 
     # CMA-ES
     popsize: int = 16
-    sigma0: float = 0.1
+    sigma0: float = 0.3
     rollouts: int = 8
     maxiter: int = 25
     workers: int = 16
@@ -69,7 +69,8 @@ class PolicyNet(nn.Module):
         if cfg.action_bounds is None:
             raise ValueError("cfg.action_bounds must be set.")
         self.cfg = cfg
-        self.fc = nn.Linear(input_dim, len(cfg.action_bounds))
+        # self.fc = nn.Sequential(nn.Linear(input_dim, 32), nn.ReLU(), nn.Linear(32, len(cfg.action_bounds)))
+        self.fc = nn.Linear(input_dim, len(cfg.action_bounds))  # input_dim = latent_dim + hidden_dim
         tanh_mask = [lo == -1 and hi == 1 for lo, hi in cfg.action_bounds]
         sigmoid_mask = [lo == 0 and hi == 1 for lo, hi in cfg.action_bounds]
         self.register_buffer("_tanh_mask", torch.tensor(tanh_mask, dtype=torch.bool))
@@ -351,8 +352,8 @@ def _cma_optimize(x0: np.ndarray, cfg: ControllerCfg) -> Tuple[np.ndarray, float
 # Orchestration
 # ────────────────────────────────────────────────────────────────────────────────
 
-def run(cfg: Optional[ControllerCfg] = None) -> None:
-    cfg = _fill_runtime(cfg or ControllerCfg())
+def run(cfg: Optional[ControllerCfg]) -> None:
+    cfg = _fill_runtime(cfg)
 
     # If a previous controller exists, start from it
     ctrl_dir = get_controller_model_dir(cfg.env, cfg.name)
@@ -386,10 +387,10 @@ if __name__ == "__main__":
 
     mp.set_start_method("spawn", force=True)
 
-    env = EnvKind.CARRACING
-    vae_name = "vae_small"
-    rnn_name = "rnn_small"
-    ctrl_name = "ctrl_small"
+    env = EnvKind.PENDULUM
+    vae_name = "baseline"
+    rnn_name = "baseline"
+    ctrl_name = "baseline"
 
     vae = VAE.load_latest(env=env, name=vae_name)  # ../../../trained_{env}_model/{vae_name}/vae_latest.pt
     rnn = MDN_LSTM.load_latest(env=env, name=rnn_name)  # ../../../trained_{env}_model/{rnn_name}/rnn_latest.pt
@@ -402,10 +403,10 @@ if __name__ == "__main__":
         vae_name=vae_name,  # used by worker processes to lazy-load
         rnn_name=rnn_name,  # used by worker processes to lazy-load
         device="cpu",
-        maxiter=25,
+        maxiter=20,
         popsize=16,
-        sigma0=0.1,
-        rollouts=8,
-        workers=16,
+        sigma0=0.3,
+        rollouts=10,
+        workers=8,
     )
     run(cfg)

@@ -40,4 +40,4 @@ def run(cfg: KeyboardPlayCfg) -> None:
 
 
 if __name__ == "__main__":
-    run(KeyboardPlayCfg(env=EnvKind.BIPEDAL_WALKER, fps=60, zoom=1.0))
+    run(KeyboardPlayCfg(env=EnvKind.PENDULUM, fps=60, zoom=1.0))

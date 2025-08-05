@@ -4,6 +4,7 @@ from typing import Type
 from src.worldmodels.envs.base import CollectorEnv
 from src.worldmodels.envs.bipedal_walker import BipedalWalkerAdapter
 from src.worldmodels.envs.carracing import CarRacingAdapter
+from src.worldmodels.envs.pendulum import PendulumAdapter
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -13,6 +14,7 @@ from src.worldmodels.envs.carracing import CarRacingAdapter
 class EnvKind(Enum):
     CARRACING = CarRacingAdapter
     BIPEDAL_WALKER = BipedalWalkerAdapter
+    PENDULUM = PendulumAdapter
 
     @property
     def adapter_cls(self) -> Type[CollectorEnv]:

@@ -72,9 +72,9 @@ def play_episode(cfg: EpisodePlayerCfg) -> None:
 
 if __name__ == "__main__":
     cfg = EpisodePlayerCfg(
-        env=EnvKind.BIPEDAL_WALKER,
+        env=EnvKind.PENDULUM,
         collection_name="baseline",
-        index=1,
+        index=2,
         fps=50,
     )
     play_episode(cfg)
